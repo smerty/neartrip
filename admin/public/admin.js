@@ -2,6 +2,45 @@
  * NearTRIP Admin Dashboard JavaScript
  */
 
+/**
+ * Show a styled alert message
+ * @param {string} type - Alert type (success, error, warning, info)
+ * @param {string} title - Alert title
+ * @param {string} message - Alert message
+ */
+function showAlert(type, title, message) {
+    // Remove any existing alerts
+    const existingAlert = document.querySelector('.custom-alert');
+    if (existingAlert) {
+        existingAlert.remove();
+    }
+    
+    const alertClass = {
+        'success': 'alert-success',
+        'error': 'alert-danger',
+        'warning': 'alert-warning',
+        'info': 'alert-info'
+    }[type] || 'alert-info';
+    
+    const alertHtml = `
+        <div class="alert ${alertClass} alert-dismissible fade show custom-alert" role="alert" style="position: fixed; top: 20px; right: 20px; z-index: 9999; max-width: 400px;">
+            <strong>${title}</strong><br>
+            ${message}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+    `;
+    
+    document.body.insertAdjacentHTML('beforeend', alertHtml);
+    
+    // Auto-dismiss after 5 seconds
+    setTimeout(() => {
+        const alert = document.querySelector('.custom-alert');
+        if (alert) {
+            alert.remove();
+        }
+    }, 5000);
+}
+
 // Global variables for UI elements
 const stationModal = new bootstrap.Modal(document.getElementById('stationModal'));
 let refreshInterval;
@@ -711,19 +750,45 @@ async function saveStation() {
         
         // Get form values
         const station = {
-            mountPoint: document.getElementById('stationMountPoint').value,
-            casterHost: document.getElementById('stationCasterHost').value,
-            casterPort: parseInt(document.getElementById('stationCasterPort').value, 10),
-            username: document.getElementById('stationUsername').value,
+            mountPoint: document.getElementById('mountPoint').value.trim(),
+            casterHost: document.getElementById('casterHost').value.trim(),
+            casterPort: parseInt(document.getElementById('casterPort').value, 10),
+            username: document.getElementById('stationUsername').value.trim(),
             password: document.getElementById('stationPassword').value,
-            latitude: parseFloat(document.getElementById('stationLatitude').value),
-            longitude: parseFloat(document.getElementById('stationLongitude').value)
+            latitude: parseFloat(document.getElementById('latitude').value),
+            longitude: parseFloat(document.getElementById('longitude').value),
+            active: document.getElementById('active').checked
         };
         
-        // Validate required fields
-        if (!station.mountPoint || !station.casterHost || !station.casterPort ||
-            isNaN(station.latitude) || isNaN(station.longitude)) {
-            alert('Please fill in all required fields');
+        // Enhanced validation
+        const errors = [];
+        
+        if (!station.mountPoint) {
+            errors.push('Mount Point is required');
+        } else if (!/^[A-Z0-9_-]+$/i.test(station.mountPoint)) {
+            errors.push('Mount Point can only contain letters, numbers, hyphens, and underscores');
+        }
+        
+        if (!station.casterHost) {
+            errors.push('Caster Host is required');
+        } else if (!/^[a-zA-Z0-9.-]+$/.test(station.casterHost)) {
+            errors.push('Caster Host must be a valid hostname or IP address');
+        }
+        
+        if (!station.casterPort || isNaN(station.casterPort) || station.casterPort < 1 || station.casterPort > 65535) {
+            errors.push('Caster Port must be a valid port number (1-65535)');
+        }
+        
+        if (isNaN(station.latitude) || station.latitude < -90 || station.latitude > 90) {
+            errors.push('Latitude must be a valid number between -90 and 90');
+        }
+        
+        if (isNaN(station.longitude) || station.longitude < -180 || station.longitude > 180) {
+            errors.push('Longitude must be a valid number between -180 and 180');
+        }
+        
+        if (errors.length > 0) {
+            showAlert('error', 'Validation Error', errors.join('<br>'));
             return;
         }
         
@@ -749,6 +814,7 @@ async function saveStation() {
             throw new Error(errorData.message || 'Failed to save station');
         }
         
+        showAlert('success', 'Success', `Station ${formAction === 'edit' ? 'updated' : 'added'} successfully`);
         stationModal.hide();
         loadStations();
         
@@ -757,7 +823,7 @@ async function saveStation() {
         }
     } catch (error) {
         console.error('Error saving station:', error);
-        alert(`Error saving station: ${error.message}`);
+        showAlert('error', 'Error', `Failed to save station: ${error.message}`);
     }
 }
 

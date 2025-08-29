@@ -54,7 +54,7 @@ The `config.json` file contains all the settings needed to run NearTRIP:
   "port": 2101,
   "mountPoint": "NEAR-Station",
   "userAgent": "NearTRIP/1.0",
-  "adminPort": 2101,
+  "adminPort": 3000,
   "adminUsername": "your_adminui_username",
   "adminPassword": "your_adminui_password",
   "stations": [

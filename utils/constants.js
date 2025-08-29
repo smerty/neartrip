@@ -1,5 +1,6 @@
 /**
  * Constants used throughout the NearTRIP application
+ * @module utils/constants
  */
 
 // HTTP and protocol constants

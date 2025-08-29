@@ -39,10 +39,11 @@ function connectToNtripCaster(casterHost, casterPort, mountPoint, username, pass
     ].join('\r\n');
 
     return new Promise((resolve, reject) => {
-        const casterSocket = net.connect(casterPort, casterHost, () => {
+        const casterSocket = net.connect(casterPort, casterHost, function() {
             logger.info(`Connected to caster: ${casterHost}:${casterPort}/${mountPoint}`);
-            casterSocket.write(headers);
-            resolve(casterSocket);
+            // Use 'this' to reference the socket inside the callback
+            this.write(headers);
+            resolve(this);
         });
 
         // Set up event handlers

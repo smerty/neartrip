@@ -103,20 +103,54 @@ function setupApiRoutes(app) {
         try {
             const newStation = req.body;
             
-            // Validate required fields
-            if (!newStation.mountPoint || !newStation.casterHost || 
-                !newStation.casterPort || !newStation.latitude || !newStation.longitude) {
-                return res.status(400).json({ error: 'Missing required station fields' });
+            // Enhanced validation
+            const errors = [];
+            
+            if (!newStation.mountPoint || typeof newStation.mountPoint !== 'string') {
+                errors.push('Mount point is required and must be a string');
+            } else if (!/^[A-Z0-9_-]+$/i.test(newStation.mountPoint.trim())) {
+                errors.push('Mount point can only contain letters, numbers, hyphens, and underscores');
+            }
+            
+            if (!newStation.casterHost || typeof newStation.casterHost !== 'string') {
+                errors.push('Caster host is required and must be a string');
+            } else if (!/^[a-zA-Z0-9.-]+$/.test(newStation.casterHost.trim())) {
+                errors.push('Caster host must be a valid hostname or IP address');
+            }
+            
+            if (!newStation.casterPort || typeof newStation.casterPort !== 'number' || 
+                newStation.casterPort < 1 || newStation.casterPort > 65535) {
+                errors.push('Caster port must be a valid port number (1-65535)');
+            }
+            
+            if (typeof newStation.latitude !== 'number' || isNaN(newStation.latitude) || 
+                newStation.latitude < -90 || newStation.latitude > 90) {
+                errors.push('Latitude must be a valid number between -90 and 90');
+            }
+            
+            if (typeof newStation.longitude !== 'number' || isNaN(newStation.longitude) || 
+                newStation.longitude < -180 || newStation.longitude > 180) {
+                errors.push('Longitude must be a valid number between -180 and 180');
+            }
+            
+            if (errors.length > 0) {
+                return res.status(400).json({ error: errors.join('; ') });
             }
 
             const config = configManager.getConfig();
             
             // Check for duplicate mountPoint
-            const exists = config.stations.some(s => s.mountPoint === newStation.mountPoint);
+            const exists = config.stations.some(s => s.mountPoint === newStation.mountPoint.trim());
             if (exists) {
                 return res.status(400).json({ error: 'Station with this mount point already exists' });
             }
 
+            // Clean and set defaults
+            newStation.mountPoint = newStation.mountPoint.trim();
+            newStation.casterHost = newStation.casterHost.trim();
+            newStation.username = newStation.username ? newStation.username.trim() : '';
+            newStation.password = newStation.password || '';
+            
             // Set active to true by default if not specified
             if (newStation.active === undefined) {
                 newStation.active = true;

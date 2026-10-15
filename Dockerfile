@@ -1,28 +1,19 @@
+FROM rust:1-alpine AS core
+RUN apk add --no-cache musl-dev
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
 FROM node:20-alpine
-
 WORKDIR /app
-
-# Copy package files
 COPY package*.json ./
-
-# Install dependencies
 RUN npm ci --only=production
-
-# Copy application code
 COPY . .
-
-# Create logs directory
+COPY --from=core /build/target/release/neartrip /usr/local/bin/neartrip
 RUN mkdir -p logs
-
-# Make entrypoint script executable
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-# Expose the NTRIP port and Admin UI port
 EXPOSE 2101 3000
-
-# Set the entrypoint
 ENTRYPOINT ["docker-entrypoint.sh"]
-
-# Start the application
-CMD ["npm", "start"]
+CMD ["node", "server.js"]

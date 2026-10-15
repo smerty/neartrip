@@ -186,21 +186,12 @@ function setupApiRoutes(app) {
             logger.error('Error deleting station:', error);
             res.status(500).json({ error: 'Failed to delete station' });
         }
-    });    // Get all connections (active and historical)
+    });    // Get all connections (active and historical).
+    // The Rust core writes logs/sessions.json. The in-memory map remains for
+    // anything still tracked inside this process.
     app.get('/api/connections', (req, res) => {
         try {
-            // Convert to array and sort - active connections first, then by connected time (newest first)
-            const connectionsList = Array.from(connections.values())
-                .sort((a, b) => {
-                    // First sort by active status
-                    if (a.active && !b.active) return -1;
-                    if (!a.active && b.active) return 1;
-                    
-                    // Then by connected time (descending - newest first)
-                    return new Date(b.connectedAt) - new Date(a.connectedAt);
-                });
-                
-            res.json(connectionsList);
+            res.json(listConnections());
         } catch (error) {
             logger.error('Error fetching connections:', error);
             res.status(500).json({ error: 'Failed to fetch connections' });
@@ -211,14 +202,17 @@ function setupApiRoutes(app) {
     app.get('/api/connections/:id/nmea-log', (req, res) => {
         try {
             const { id } = req.params;
-            
-            if (!connections.has(id)) {
+            if (!/^[a-f0-9]+$/i.test(id)) {
+                return res.status(400).json({ error: 'Invalid connection id' });
+            }
+
+            const connection = findConnection(id);
+            if (!connection) {
                 return res.status(404).json({ error: 'Connection not found' });
             }
-            
-            const connection = connections.get(id);
-            
-            if (!connection.nmeaLogFile || !fs.existsSync(connection.nmeaLogFile)) {
+
+            const logPath = connectionLogPath(id, connection);
+            if (!logPath || !fs.existsSync(logPath)) {
                 return res.status(404).json({ error: 'NMEA log not found for this connection' });
             }
             
@@ -227,7 +221,7 @@ function setupApiRoutes(app) {
             res.setHeader('Content-Disposition', `attachment; filename="connection-${id}.nmea.log"`);
             
             // Create read stream and pipe to response
-            const fileStream = fs.createReadStream(connection.nmeaLogFile);
+            const fileStream = fs.createReadStream(logPath);
             fileStream.pipe(res);
         } catch (error) {
             logger.error('Error fetching NMEA log:', error);
@@ -327,6 +321,50 @@ function setupApiRoutes(app) {
  * 
  * @param {Object} config - The configuration to save
  */
+function coreSessions() {
+    const file = path.join(__dirname, '..', 'logs', 'sessions.json');
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function listConnections() {
+    const fromCore = coreSessions();
+    const list = fromCore || Array.from(connections.values());
+    return list.sort((a, b) => {
+        if (a.active && !b.active) return -1;
+        if (!a.active && b.active) return 1;
+        return new Date(b.connectedAt) - new Date(a.connectedAt);
+    });
+}
+
+function findConnection(id) {
+    const fromCore = coreSessions();
+    if (fromCore) {
+        const match = fromCore.find((session) => session.id === id);
+        if (match) {
+            return match;
+        }
+    }
+    return connections.get(id);
+}
+
+function connectionLogPath(id, connection) {
+    const root = path.resolve(__dirname, '..', 'logs', 'connections');
+    const expected = path.join(root, `${id}.nmea.log`);
+    if (!connection.nmeaLogFile) {
+        return fs.existsSync(expected) ? expected : null;
+    }
+    const requested = path.resolve(__dirname, '..', connection.nmeaLogFile);
+    if (requested !== expected) {
+        return null;
+    }
+    return requested;
+}
+
 function saveConfig(config) {
     const configPath = configManager.CONFIG_FILE_PATH;
     fs.writeFileSync(configPath, JSON.stringify(config, null, 4));

@@ -1,0 +1,32 @@
+{
+  "clients": 2000,
+  "ready": 2000,
+  "receiving_during_window": 2000,
+  "receiving_at_end": 2000,
+  "frames_received": 402340,
+  "frames_emitted": 402264,
+  "actual_offered_hz_per_rover": 19.697144543152525,
+  "mib_s": 38.47825378422575,
+  "p50_ms": 1.425562,
+  "p99_ms": 11.511064,
+  "p99_interframe_ms": 56.48975199801498,
+  "min_frames_per_rover": 201,
+  "cpu_percent": 69.13959015703958,
+  "generator_cpu_percent": 80.36601114278614,
+  "peak_rss_mib": 136.9453125,
+  "elapsed_s": 10.211226280000119,
+  "errors": {},
+  "alive": true,
+  "memory_sample": {
+    "1092753": {
+      "status": "Name:\tnode\nUmask:\t0002\nState:\tS (sleeping)\nTgid:\t1092753\nNgid:\t0\nPid:\t1092753\nPPid:\t1092747\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t4 24 27 30 46 120 133 134 998 1000 \nNStgid:\t1092753\nNSpid:\t1092753\nNSpgid:\t1092747\nNSsid:\t1092747\nKthread:\t0\nVmPeak:\t 1077040 kB\nVmSize:\t 1013704 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t   63024 kB\nVmRSS:\t   58600 kB\nRssAnon:\t   11308 kB\nRssFile:\t   47292 kB\nRssShmem:\t       0 kB\nVmData:\t   54680 kB\nVmStk:\t     132 kB\nVmExe:\t   38724 kB\nVmLib:\t    4032 kB\nVmPTE:\t     676 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff\nThreads:\t7\nSigQ:\t0/49353\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000001001000\nSigCgt:\t0000000100014602\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tconditional enabled\nCpus_allowed:\t3ff\nCpus_allowed_list:\t0-9\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t31\nnonvoluntary_ctxt_switches:\t4\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "smaps_rollup": "00400000-7fffe5bbe000 ---p 00000000 00:00 0                              [rollup]\nRss:               58600 kB\nPss:               34685 kB\nPss_Dirty:         11324 kB\nPss_Anon:          11308 kB\nPss_File:          23377 kB\nPss_Shmem:             0 kB\nShared_Clean:      44208 kB\nShared_Dirty:          0 kB\nPrivate_Clean:      3068 kB\nPrivate_Dirty:     11324 kB\nReferenced:        58600 kB\nAnonymous:         11308 kB\nKSM:                   0 kB\nLazyFree:              0 kB\nAnonHugePages:         0 kB\nShmemPmdMapped:        0 kB\nFilePmdMapped:         0 kB\nShared_Hugetlb:        0 kB\nPrivate_Hugetlb:       0 kB\nSwap:                  0 kB\nSwapPss:               0 kB\nLocked:                0 kB\n"
+    },
+    "1092767": {
+      "status": "Name:\tneartrip\nUmask:\t0002\nState:\tS (sleeping)\nTgid:\t1092767\nNgid:\t0\nPid:\t1092767\nPPid:\t1092753\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t8192\nGroups:\t4 24 27 30 46 120 133 134 998 1000 \nNStgid:\t1092767\nNSpid:\t1092767\nNSpgid:\t1092747\nNSsid:\t1092747\nKthread:\t0\nVmPeak:\t 3896152 kB\nVmSize:\t 3847204 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t   78540 kB\nVmRSS:\t   78540 kB\nRssAnon:\t   74936 kB\nRssFile:\t    3604 kB\nRssShmem:\t       0 kB\nVmData:\t  201680 kB\nVmStk:\t     132 kB\nVmExe:\t    1356 kB\nVmLib:\t    2384 kB\nVmPTE:\t     660 kB\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff\nThreads:\t57\nSigQ:\t0/49353\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000001000\nSigCgt:\t0000000100004442\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tconditional enabled\nCpus_allowed:\t3ff\nCpus_allowed_list:\t0-9\nMems_allowed:\t00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t1617\nnonvoluntary_ctxt_switches:\t3\nx86_Thread_features:\t\nx86_Thread_features_locked:\t\n",
+      "smaps_rollup": "5754fc7d7000-7ffe2c461000 ---p 00000000 00:00 0                          [rollup]\nRss:               78540 kB\nPss:               76303 kB\nPss_Dirty:         74936 kB\nPss_Anon:          74936 kB\nPss_File:           1367 kB\nPss_Shmem:             0 kB\nShared_Clean:       2268 kB\nShared_Dirty:          0 kB\nPrivate_Clean:      1336 kB\nPrivate_Dirty:     74936 kB\nReferenced:        78540 kB\nAnonymous:         74936 kB\nKSM:                   0 kB\nLazyFree:              0 kB\nAnonHugePages:         0 kB\nShmemPmdMapped:        0 kB\nFilePmdMapped:         0 kB\nShared_Hugetlb:        0 kB\nPrivate_Hugetlb:       0 kB\nSwap:                  0 kB\nSwapPss:               0 kB\nLocked:                0 kB\n"
+    }
+  },
+  "service_log": "/tmp/neartrip-benchmark/run-lsjbr93n/service.log",
+  "profile_log": "SESSION_TASK_BYTES 27608\nREGISTRY_PROFILE calls=9347 wait_ns=6088394 hold_ns=8102788\nREGISTRY_PROFILE calls=41013 wait_ns=121356503 hold_ns=86601797\nREGISTRY_PROFILE calls=43558 wait_ns=108790457 hold_ns=100863414\nREGISTRY_PROFILE calls=43543 wait_ns=96191149 hold_ns=99580740\nREGISTRY_PROFILE calls=43652 wait_ns=106353455 hold_ns=100171651\nREGISTRY_PROFILE calls=43528 wait_ns=129625028 hold_ns=100165661\nREGISTRY_PROFILE calls=43181 wait_ns=90038649 hold_ns=99259677\nREGISTRY_PROFILE calls=43549 wait_ns=126826578 hold_ns=99346938\nREGISTRY_PROFILE calls=43745 wait_ns=121546179 hold_ns=99695811\nREGISTRY_PROFILE calls=43458 wait_ns=87856363 hold_ns=99052813\nREGISTRY_PROFILE calls=43464 wait_ns=76539218 hold_ns=100137101\nREGISTRY_PROFILE calls=43578 wait_ns=89024521 hold_ns=98703148\nREGISTRY_PROFILE calls=43653 wait_ns=104203967 hold_ns=99710777\nREGISTRY_PROFILE calls=42792 wait_ns=85392067 hold_ns=101776163"
+}

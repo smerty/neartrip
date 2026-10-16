@@ -76,7 +76,10 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            registry_flush.flush();
+            let registry = Arc::clone(&registry_flush);
+            if let Err(err) = tokio::task::spawn_blocking(move || registry.flush()).await {
+                tracing::error!(%err, "session snapshot task failed");
+            }
         }
     });
 

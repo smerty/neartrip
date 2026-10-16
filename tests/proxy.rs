@@ -90,6 +90,31 @@ async fn split_gngga_is_forwarded_and_a_farther_fix_switches_caster() {
     proxy.stop();
 }
 
+#[tokio::test]
+async fn correction_bursts_larger_than_the_read_buffer_are_preserved() {
+    static PAYLOAD: [u8; 128 * 1024] = [0xD3; 128 * 1024];
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    spawn_caster(caster, &PAYLOAD, Arc::new(Mutex::new(Vec::new())));
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    let request = format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    let mut received = vec![0; PAYLOAD.len()];
+    timeout(Duration::from_secs(3), client.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, PAYLOAD);
+    proxy.stop();
+}
+
 struct Proxy {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,

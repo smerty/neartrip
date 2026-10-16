@@ -1,4 +1,5 @@
 //! Live session table written to `logs/sessions.json` for the admin UI.
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -42,7 +43,40 @@ struct SessionRecord {
 
 pub struct Registry {
     path: PathBuf,
-    inner: Mutex<Vec<SessionRecord>>,
+    inner: Mutex<SessionTable>,
+    flush_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct SessionTable {
+    records: Vec<SessionRecord>,
+    by_id: HashMap<String, usize>,
+}
+
+impl SessionTable {
+    fn push(&mut self, record: SessionRecord) {
+        self.by_id.insert(record.id.clone(), self.records.len());
+        self.records.push(record);
+    }
+
+    fn get_mut(&mut self, id: &str) -> Option<&mut SessionRecord> {
+        let index = *self.by_id.get(id)?;
+        self.records.get_mut(index)
+    }
+
+    fn prune(&mut self, now: u64) {
+        let previous_len = self.records.len();
+        self.records.retain(|session| match session.disconnected_unix {
+            Some(then) => now.saturating_sub(then) < HISTORY_SECS,
+            None => true,
+        });
+        if self.records.len() != previous_len {
+            self.by_id.clear();
+            for (index, session) in self.records.iter().enumerate() {
+                self.by_id.insert(session.id.clone(), index);
+            }
+        }
+    }
 }
 
 pub struct LiveSession {
@@ -59,7 +93,8 @@ impl Registry {
         let _ = fs::create_dir_all(Path::new("logs/connections"));
         Self {
             path,
-            inner: Mutex::new(Vec::new()),
+            inner: Mutex::new(SessionTable::default()),
+            flush_lock: Mutex::new(()),
         }
     }
 
@@ -113,7 +148,7 @@ impl Registry {
 
     pub fn position(&self, id: &str, lat: f64, lon: f64, fix_quality: u32, satellites: u32) {
         self.with_mut(|sessions| {
-            if let Some(session) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(session) = sessions.get_mut(id) {
                 session.latitude = Some(lat);
                 session.longitude = Some(lon);
                 session.fix_quality = Some(fix_quality);
@@ -124,7 +159,7 @@ impl Registry {
 
     pub fn station(&self, id: &str, mount: &str) {
         self.with_mut(|sessions| {
-            if let Some(session) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(session) = sessions.get_mut(id) {
                 session.current_station = Some(mount.to_string());
             }
         });
@@ -132,7 +167,7 @@ impl Registry {
 
     pub fn add_bytes(&self, id: &str, sent: u64, received: u64) {
         self.with_mut(|sessions| {
-            if let Some(session) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(session) = sessions.get_mut(id) {
                 session.bytes_sent += sent;
                 session.bytes_received += received;
             }
@@ -146,7 +181,7 @@ impl Registry {
     pub fn close(&self, id: &str) {
         let (stamp, unix) = now_unix();
         self.with_mut(|sessions| {
-            if let Some(session) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(session) = sessions.get_mut(id) {
                 session.active = false;
                 session.disconnected_at = Some(stamp);
                 session.disconnected_unix = Some(unix);
@@ -155,16 +190,16 @@ impl Registry {
     }
 
     pub fn flush(&self) {
+        // Serialize writers to the shared temporary path, without holding the
+        // session lock during serialization or filesystem I/O.
+        let _writer = self.flush_lock.lock().unwrap_or_else(|err| err.into_inner());
         let snapshot = self.with_mut(|sessions| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            sessions.retain(|session| match session.disconnected_unix {
-                Some(then) => now.saturating_sub(then) < HISTORY_SECS,
-                None => true,
-            });
-            sessions.clone()
+            sessions.prune(now);
+            sessions.records.clone()
         });
         let Ok(text) = serde_json::to_vec_pretty(&snapshot) else {
             return;
@@ -180,7 +215,7 @@ impl Registry {
         }
     }
 
-    fn with_mut<T>(&self, f: impl FnOnce(&mut Vec<SessionRecord>) -> T) -> T {
+    fn with_mut<T>(&self, f: impl FnOnce(&mut SessionTable) -> T) -> T {
         let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         f(&mut guard)
     }
@@ -248,6 +283,79 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(id: &str, disconnected: Option<u64>) -> SessionRecord {
+        SessionRecord {
+            id: id.into(),
+            client_ip: "127.0.0.1".into(),
+            client_port: 1234,
+            connected_at: "1970-01-01T00:00:00.000Z".into(),
+            disconnected_at: None,
+            active: disconnected.is_none(),
+            latitude: None,
+            longitude: None,
+            fix_quality: None,
+            num_satellites: None,
+            current_station: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+            nmea_log_file: "test.nmea.log".into(),
+            disconnected_unix: disconnected,
+        }
+    }
+
+    #[test]
+    fn pruning_reindexes_surviving_sessions_and_preserves_active_ones() {
+        let mut table = SessionTable::default();
+        table.push(record("expired", Some(1)));
+        table.push(record("active", None));
+        table.push(record("recent", Some(HISTORY_SECS)));
+        table.prune(HISTORY_SECS + 1);
+        assert!(table.get_mut("expired").is_none());
+        assert_eq!(table.by_id.len(), 2);
+        table.get_mut("active").unwrap().bytes_sent = 42;
+        assert_eq!(table.records[0].id, "active");
+        assert_eq!(table.records[0].bytes_sent, 42);
+        assert_eq!(table.get_mut("recent").unwrap().id, "recent");
+        table.push(record("new", None));
+        assert_eq!(table.get_mut("new").unwrap().id, "new");
+    }
+
+    #[test]
+    fn concurrent_counters_and_snapshots_preserve_the_admin_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "neartrip-registry-test-{}-{}.json", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let registry = std::sync::Arc::new(Registry::new(&path));
+        registry.with_mut(|table| table.push(record("rover", None)));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    registry.add_bytes("rover", 10, 1);
+                }
+                registry.flush();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        registry.position("rover", 37.0, -122.0, 1, 8);
+        registry.station("rover", "A");
+        registry.close("rover");
+        registry.flush();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json[0]["bytesSent"], 40000);
+        assert_eq!(json[0]["bytesReceived"], 4000);
+        assert_eq!(json[0]["currentStation"], "A");
+        assert_eq!(json[0]["latitude"], 37.0);
+        assert_eq!(json[0]["numSatellites"], 8);
+        assert_eq!(json[0]["active"], false);
+        assert!(json[0]["disconnectedAt"].is_string());
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn epoch_formats_as_utc() {

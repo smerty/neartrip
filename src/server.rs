@@ -74,7 +74,8 @@ async fn handle_client(
         tracing::debug!(%id, %err, "session ended");
     }
     registry.close(&id);
-    registry.flush();
+    // The periodic snapshot coalesces disconnects instead of rewriting the
+    // entire history on every close. Shutdown also publishes a final snapshot.
     tracing::info!(%id, %peer, "client disconnected");
 }
 
@@ -86,7 +87,7 @@ async fn session(
 ) -> Result<(), String> {
     let (mut client_read, mut client_write) = socket.into_split();
     let mut incoming = Vec::new();
-    let mut tmp = [0u8; 4096];
+    let mut tmp = [0u8; 1024];
     loop {
         let n = read_some(&mut client_read, &mut tmp).await?;
         registry.add_bytes(&live.id, 0, n as u64);
@@ -207,8 +208,10 @@ async fn stream(
     live: &crate::registry::LiveSession,
 ) -> Result<(), String> {
     let mut line_buf = pending;
-    let mut tmp = [0u8; 4096];
-    let mut up_buf = [0u8; 16384];
+    // Inline arrays live in every suspended rover task. Keep them bounded;
+    // TCP reads may split any sentence or correction burst across iterations.
+    let mut tmp = [0u8; 1024];
+    let mut up_buf = [0u8; 4096];
     let mut upstream: Option<Upstream> = None;
     let mut last_fail: Option<(String, Instant)> = None;
 

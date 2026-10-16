@@ -5,6 +5,9 @@
     "port": 2101,
     "mountPoint": "NEAR-Place",
     "userAgent": "NearTrip/1.0",
+    "adminPort": 3000,
+    "adminUsername": "admin",
+    "adminPassword": "changeme",
     "stations": [
         {
             "mountPoint": "LAX_2",
@@ -13,7 +16,8 @@
             "username": "person",
             "password": "secret",
             "latitude": 24.345,
-            "longitude": -125.456
+            "longitude": -125.456,
+            "active": true
         },
         {
             "mountPoint": "SFO_1",
@@ -22,7 +26,8 @@
             "username": "human",
             "password": "",
             "latitude": 34.567,
-            "longitude": -123.456
+            "longitude": -123.456,
+            "active": true
         }
     ]
 }

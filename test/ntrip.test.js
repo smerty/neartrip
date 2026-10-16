@@ -42,7 +42,8 @@ jest.mock('net', () => {
   
   return {
     connect: jest.fn().mockImplementation((port, host, callback) => {
-      callback();
+      // Store the callback to call later, but don't call it immediately
+      mockSocket._connectionCallback = callback;
       return mockSocket;
     }),
     Socket: jest.fn().mockImplementation(() => mockSocket),
@@ -58,7 +59,7 @@ describe('NTRIP Utilities', () => {
 
   describe('connectToNtripCaster', () => {
     test('should connect to NTRIP caster and write headers', async () => {
-      const casterSocket = await ntrip.connectToNtripCaster(
+      const connectPromise = ntrip.connectToNtripCaster(
         'test.caster.com',
         2101,
         'TEST',
@@ -67,14 +68,20 @@ describe('NTRIP Utilities', () => {
         'TestAgent/1.0'
       );
       
+      // Simulate successful connection
+      const mockSocket = net._getMockSocket();
+      mockSocket._connectionCallback.call(mockSocket);
+      
+      const casterSocket = await connectPromise;
+      
       expect(net.connect).toHaveBeenCalledWith(2101, 'test.caster.com', expect.any(Function));
       expect(casterSocket.write).toHaveBeenCalledWith(expect.stringContaining('GET /TEST HTTP/1.1'));
       expect(casterSocket.write).toHaveBeenCalledWith(expect.stringContaining('Authorization: Basic'));
     });
 
-    test('should throw an error for missing required parameters', async () => {
-      await expect(ntrip.connectToNtripCaster(null, 2101, 'TEST', 'user', 'pass', 'Agent'))
-        .rejects.toThrow('Missing required connection parameters');
+    test('should throw an error for missing required parameters', () => {
+      expect(() => ntrip.connectToNtripCaster(null, 2101, 'TEST', 'user', 'pass', 'Agent'))
+        .toThrow('Missing required connection parameters');
     });
 
     test('should handle connection errors', async () => {

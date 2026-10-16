@@ -5,6 +5,8 @@
 // Global variables for UI elements
 const stationModal = new bootstrap.Modal(document.getElementById('stationModal'));
 let refreshInterval;
+let configEditorLoaded = false;
+let configEditorLoading = false;
 
 // Map variables
 let map = null;
@@ -88,6 +90,10 @@ function loadTabFromUrlHash() {
         });
         document.querySelector('.navbar-nav .nav-link[href="#stations"]').classList.add('active');
     }
+
+    if (hash === 'settings' && !configEditorLoaded) {
+        loadConfigEditor();
+    }
 }
 
 /**
@@ -144,6 +150,10 @@ function setupEventListeners() {    // Add station button
                 this.classList.add('active');
             }
             
+            if (targetId === 'settings' && !configEditorLoaded) {
+                loadConfigEditor();
+            }
+
             // Refresh map if showing map view
             if (targetId === 'map' && map) {
                 map.invalidateSize();
@@ -175,11 +185,6 @@ async function loadServerInfo() {
             Mount Point: ${data.config.mountPoint} | 
             Stations: ${data.config.stations.length}
         `;
-        
-        // Load config editor if we're on the settings tab
-        if (document.getElementById('settings').style.display !== 'none') {
-            loadConfigEditor();
-        }
     } catch (error) {
         console.error('Error loading server info:', error);
         document.getElementById('serverInfo').innerHTML = `
@@ -570,6 +575,8 @@ async function updateServerInfoWithoutConfigRefresh() {
  * Load the configuration editor with the current config
  */
 async function loadConfigEditor() {
+    if (configEditorLoading) return;
+    configEditorLoading = true;
     try {
         const response = await fetch('/api/config');
         if (!response.ok) throw new Error('Failed to fetch configuration');
@@ -578,9 +585,12 @@ async function loadConfigEditor() {
         
         // Format the JSON with 2-space indentation for better readability
         document.getElementById('configEditor').value = JSON.stringify(config, null, 2);
+        configEditorLoaded = true;
     } catch (error) {
         console.error('Error loading configuration:', error);
         document.getElementById('configEditor').value = `Error loading configuration: ${error.message}`;
+    } finally {
+        configEditorLoading = false;
     }
 }
 

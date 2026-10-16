@@ -2,3 +2,5 @@ config.json
 node_modules
 nmea.log
 application.log
+/target
+logs/

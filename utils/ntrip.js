@@ -1,6 +1,6 @@
 /**
- * NTRIP Communication utilities
- * @module utils/ntrip
+ * NTRIP client helpers kept for the original JavaScript unit tests.
+ * The running proxy is the Rust core in `src/`.
  */
 const net = require('net');
 const logger = require('./logger');

@@ -1,6 +1,6 @@
 /**
- * GPS coordinate and NMEA sentence parsing utilities
- * @module utils/gps
+ * GPS helpers kept for the original JavaScript unit tests.
+ * Station selection for live rovers is in the Rust core (`src/geo.rs`).
  */
 const geolib = require('geolib');
 const logger = require('./logger');

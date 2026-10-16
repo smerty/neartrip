@@ -35,12 +35,17 @@ NearTRIP is an intelligent NTRIP proxy that automatically connects to the closes
    npm install
    ```
 
-3. Create configuration file:
+3. Build the NTRIP core:
+   ```
+   cargo build --release
+   ```
+
+4. Create configuration file:
    ```
    cp config.json.sample config.json
    ```
 
-4. Edit `config.json` with your settings and available NTRIP stations.
+5. Edit `config.json` with your settings and available NTRIP stations.
 
 ## Configuration
 
@@ -54,7 +59,7 @@ The `config.json` file contains all the settings needed to run NearTRIP:
   "port": 2101,
   "mountPoint": "NEAR-Station",
   "userAgent": "NearTRIP/1.0",
-  "adminPort": 2101,
+  "adminPort": 3000,
   "adminUsername": "your_adminui_username",
   "adminPassword": "your_adminui_password",
   "stations": [
@@ -86,20 +91,19 @@ You can:
 - Change station details (coordinates, credentials, active status)
 - Update server settings
 
-Existing client connections will remain stable. Changes take effect:
-- Immediately for new connections
-- When clients send updated location information
-- When clients reconnect
+Existing client connections stay up. Station changes apply on the next GGA sentence. Changes to the listen port, bind address, or admin password apply on the next process start.
 
 ## Usage
 
-Start the NearTRIP server:
+Start the admin UI and the Rust NTRIP core:
 
 ```
 npm start
 ```
 
-Connect your GNSS receiver to the NearTRIP server using the IP address and port specified in your configuration.
+`npm start` runs the admin UI and the `neartrip` binary (`target/release/neartrip`, then `target/debug/neartrip`, then `neartrip` on `PATH`). Connect a GNSS receiver to the address and port in `config.json`. The core reads the same `config.json` the admin UI writes, and it reloads station changes without a restart.
+
+Set `username` and `password` in `config.json` to require those credentials on the virtual mountpoint. Leave both empty to accept unauthenticated rovers. The admin UI is still the Node process on `adminPort` (default 3000).
 
 ## How it Works
 

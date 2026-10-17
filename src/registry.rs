@@ -100,20 +100,29 @@ impl Registry {
         }
     }
 
-    /// Publish the session table about once a second, and immediately when a
-    /// rover connects, switches station, or disconnects.
+    /// Publish the session table at most once a second.
+    ///
+    /// Connect, station-switch, and disconnect mark the table dirty, but a
+    /// burst still produces one rewrite per second. Byte counters use the
+    /// same cadence. Rewriting the whole history on every close was the cost
+    /// removed from the 2,000-rover runs.
     pub fn start_snapshots(self: &Arc<Self>) {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(1);
+            let mut next_flush = tokio::time::Instant::now();
             loop {
                 tokio::select! {
-                    _ = registry.changed.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = registry.changed.notified() => {
+                        tokio::time::sleep_until(next_flush).await;
+                    }
+                    _ = tokio::time::sleep_until(next_flush) => {}
                 }
                 let registry = Arc::clone(&registry);
                 if tokio::task::spawn_blocking(move || registry.flush()).await.is_err() {
                     break;
                 }
+                next_flush = tokio::time::Instant::now() + interval;
             }
         });
     }
@@ -236,7 +245,6 @@ impl Registry {
         if let Err(err) = (|| {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&text)?;
-            file.sync_all()?;
             fs::rename(&tmp, &self.path)?;
             Ok::<(), std::io::Error>(())
         })() {

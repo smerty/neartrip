@@ -135,7 +135,7 @@ impl Registry {
             {
                 Ok(file) => file,
                 Err(err) => {
-                    tracing::warn!(%err, path = %log_path.display(), "nmea log unavailable");
+                    tracing::warn!(%err, path = %log_path, "nmea log unavailable");
                     return;
                 }
             };

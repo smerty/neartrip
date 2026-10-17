@@ -4,13 +4,13 @@ use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 const HISTORY_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -45,6 +45,7 @@ pub struct Registry {
     path: PathBuf,
     inner: Mutex<SessionTable>,
     flush_lock: Mutex<()>,
+    changed: Notify,
 }
 
 #[derive(Default)]
@@ -90,21 +91,46 @@ impl Registry {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let _ = fs::create_dir_all(Path::new("logs/connections"));
         Self {
             path,
             inner: Mutex::new(SessionTable::default()),
             flush_lock: Mutex::new(()),
+            changed: Notify::new(),
         }
+    }
+
+    /// Publish the session table about once a second, and immediately when a
+    /// rover connects, switches station, or disconnects.
+    pub fn start_snapshots(self: &Arc<Self>) {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = registry.changed.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+                let registry = Arc::clone(&registry);
+                if tokio::task::spawn_blocking(move || registry.flush()).await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     pub async fn open(&self, peer: SocketAddr) -> LiveSession {
         let id = session_id();
         let nmea_log_file = format!("logs/connections/{id}.nmea.log");
+        let log_path = self
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("connections")
+            .join(format!("{id}.nmea.log"));
         let (tx, mut rx) = mpsc::channel::<String>(64);
-        let log_path = nmea_log_file.clone();
         tokio::spawn(async move {
-            let _ = tokio::fs::create_dir_all("logs/connections").await;
+            if let Some(dir) = log_path.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
             let mut file = match OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -113,7 +139,7 @@ impl Registry {
             {
                 Ok(file) => file,
                 Err(err) => {
-                    tracing::warn!(%err, %log_path, "nmea log unavailable");
+                    tracing::warn!(%err, path = %log_path.display(), "nmea log unavailable");
                     return;
                 }
             };
@@ -143,6 +169,7 @@ impl Registry {
                 disconnected_unix: None,
             });
         });
+        self.changed.notify_one();
         LiveSession { id, nmea: tx }
     }
 
@@ -163,6 +190,7 @@ impl Registry {
                 session.current_station = Some(mount.to_string());
             }
         });
+        self.changed.notify_one();
     }
 
     pub fn add_bytes(&self, id: &str, sent: u64, received: u64) {
@@ -187,6 +215,7 @@ impl Registry {
                 session.disconnected_unix = Some(unix);
             }
         });
+        self.changed.notify_one();
     }
 
     pub fn flush(&self) {
@@ -208,10 +237,14 @@ impl Registry {
             let _ = fs::create_dir_all(dir);
         }
         let tmp = self.path.with_extension("json.tmp");
-        if let Ok(mut file) = fs::File::create(&tmp) {
-            if file.write_all(&text).is_ok() {
-                let _ = fs::rename(&tmp, &self.path);
-            }
+        if let Err(err) = (|| {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(&text)?;
+            file.sync_all()?;
+            fs::rename(&tmp, &self.path)?;
+            Ok::<(), std::io::Error>(())
+        })() {
+            tracing::warn!(%err, path = %self.path.display(), "session snapshot failed");
         }
     }
 
@@ -360,5 +393,35 @@ mod tests {
     #[test]
     fn epoch_formats_as_utc() {
         assert_eq!(unix_to_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[tokio::test]
+    async fn a_connected_rover_is_published_for_the_admin_ui() {
+        let path = std::env::temp_dir().join(format!(
+            "neartrip-live-{}-{}.json",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let registry = std::sync::Arc::new(Registry::new(&path));
+        registry.start_snapshots();
+        let peer = "203.0.113.10:45000".parse().unwrap();
+        let live = registry.open(peer).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut snapshot = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = fs::read_to_string(&path) {
+                snapshot = text;
+                if snapshot.contains(&live.id) && snapshot.contains("\"active\": true") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            snapshot.contains(&live.id) && snapshot.contains("\"active\": true"),
+            "admin snapshot was {snapshot}"
+        );
+        assert!(snapshot.contains("203.0.113.10"), "{snapshot}");
+        let _ = fs::remove_file(&path);
     }
 }

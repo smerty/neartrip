@@ -81,6 +81,9 @@ function loadTabFromUrlHash() {
     if (hash === 'settings' && !configEditorLoaded) {
         loadConfigEditor();
     }
+    if (hash === 'connections' || hash === 'home') {
+        loadConnections();
+    }
 }
 
 /**

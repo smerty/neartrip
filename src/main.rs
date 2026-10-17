@@ -54,8 +54,6 @@ async fn main() {
 
     let (config_tx, config_rx) = watch::channel(config);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let registry_flush = Arc::clone(&registry);
-
     let reload_path = path.clone();
     tokio::spawn(async move {
         let mut last_modified = std::fs::metadata(&reload_path).and_then(|m| m.modified()).ok();
@@ -73,15 +71,7 @@ async fn main() {
         }
     });
 
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let registry = Arc::clone(&registry_flush);
-            if let Err(err) = tokio::task::spawn_blocking(move || registry.flush()).await {
-                tracing::error!(%err, "session snapshot task failed");
-            }
-        }
-    });
+    registry.start_snapshots();
 
     tokio::spawn(async move {
         shutdown_signal().await;

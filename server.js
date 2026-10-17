@@ -44,8 +44,19 @@ function coreBinary() {
 
 function startCore() {
     const bin = coreBinary();
+    const root = __dirname;
     logger.info(`Starting Rust core: ${bin}`);
-    const child = spawn(bin, [], { stdio: 'inherit' });
+    // The admin UI reads logs/sessions.json next to this file. The core must
+    // use that same directory even when this process was started elsewhere.
+    const child = spawn(bin, [], {
+        cwd: root,
+        stdio: 'inherit',
+        env: {
+            ...process.env,
+            NEARTRIP_CONFIG: path.join(root, 'config.json'),
+            NEARTRIP_SESSIONS: path.join(root, 'logs', 'sessions.json'),
+        },
+    });
     child.on('error', (error) => {
         logger.error(`Failed to start Rust core (${bin}): ${error.message}`);
         logger.error('Build it with: cargo build --release');

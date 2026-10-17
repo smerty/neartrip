@@ -13,7 +13,7 @@ function dashboard(hash = '') {
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
             style: {}, value: '', listeners: {},
-            classList: { add() {}, remove() {} },
+            classList: { add() {}, remove() {}, toggle() {} },
             addEventListener(event, fn) { this.listeners[event] = fn; },
         });
         return elements.get(id);
@@ -25,6 +25,16 @@ function dashboard(hash = '') {
     const requests = [];
     let failConfig = false;
     const config = { mountPoint: 'EXISTING-MOUNT', stations: [{ mountPoint: 'BASE' }] };
+    const location = {
+        _hash: hash,
+        get hash() { return this._hash; },
+        set hash(value) {
+            const next = String(value).startsWith('#') ? String(value) : `#${value}`;
+            if (next === this._hash) return;
+            this._hash = next;
+            if (events.hashchange) events.hashchange();
+        },
+    };
     const context = vm.createContext({
         bootstrap: { Modal: class {} },
         document: {
@@ -33,7 +43,15 @@ function dashboard(hash = '') {
             querySelectorAll(selector) { return selector.startsWith('#stations') ? sections.map(element) : links; },
             querySelector(selector) { return links.find(link => selector.includes(`"${link.getAttribute()}"`)); },
         },
-        window: { location: { hash } },
+        history: {
+            replaceState(_state, _title, url) {
+                location.hash = String(url).includes('#') ? String(url).slice(String(url).indexOf('#')) : url;
+            },
+        },
+        window: {
+            location,
+            addEventListener(event, fn) { events[event] = fn; },
+        },
         setInterval() {}, setTimeout,
         console: { error() {} },
         async fetch(url) {

@@ -27,8 +27,15 @@ function loadConfig() {
 }
 
 function coreBinary() {
-    if (process.env.NEARTRIP_BIN) {
-        return process.env.NEARTRIP_BIN;
+    const override = process.env.NEARTRIP_BIN;
+    if (override) {
+        // Resolve path overrides from the launch directory. spawn() below
+        // changes cwd, which would otherwise make ./bin/core miss the file.
+        // A bare command name is left for PATH lookup.
+        if (path.isAbsolute(override) || override.includes('/') || override.includes('\\')) {
+            return path.resolve(override);
+        }
+        return override;
     }
     const candidates = [
         path.join(__dirname, 'target', 'release', 'neartrip'),

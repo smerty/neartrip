@@ -91,6 +91,7 @@ impl Registry {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
+        let _ = fs::create_dir_all(Path::new("logs/connections"));
         Self {
             path,
             inner: Mutex::new(SessionTable::default()),
@@ -119,18 +120,13 @@ impl Registry {
 
     pub async fn open(&self, peer: SocketAddr) -> LiveSession {
         let id = session_id();
+        // This relative path is what the admin UI opens. The process working
+        // directory is the application root, so the write lands in the same place.
         let nmea_log_file = format!("logs/connections/{id}.nmea.log");
-        let log_path = self
-            .path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("connections")
-            .join(format!("{id}.nmea.log"));
+        let log_path = nmea_log_file.clone();
         let (tx, mut rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
-            if let Some(dir) = log_path.parent() {
-                let _ = tokio::fs::create_dir_all(dir).await;
-            }
+            let _ = tokio::fs::create_dir_all("logs/connections").await;
             let mut file = match OpenOptions::new()
                 .create(true)
                 .append(true)

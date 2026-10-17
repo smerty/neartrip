@@ -27,8 +27,15 @@ function loadConfig() {
 }
 
 function coreBinary() {
-    if (process.env.NEARTRIP_BIN) {
-        return process.env.NEARTRIP_BIN;
+    const override = process.env.NEARTRIP_BIN;
+    if (override) {
+        // Resolve path overrides from the launch directory. spawn() below
+        // changes cwd, which would otherwise make ./bin/core miss the file.
+        // A bare command name is left for PATH lookup.
+        if (path.isAbsolute(override) || override.includes('/') || override.includes('\\')) {
+            return path.resolve(override);
+        }
+        return override;
     }
     const candidates = [
         path.join(__dirname, 'target', 'release', 'neartrip'),
@@ -44,8 +51,19 @@ function coreBinary() {
 
 function startCore() {
     const bin = coreBinary();
+    const root = __dirname;
     logger.info(`Starting Rust core: ${bin}`);
-    const child = spawn(bin, [], { stdio: 'inherit' });
+    // The admin UI reads logs/sessions.json next to this file. The core must
+    // use that same directory even when this process was started elsewhere.
+    const child = spawn(bin, [], {
+        cwd: root,
+        stdio: 'inherit',
+        env: {
+            ...process.env,
+            NEARTRIP_CONFIG: path.join(root, 'config.json'),
+            NEARTRIP_SESSIONS: path.join(root, 'logs', 'sessions.json'),
+        },
+    });
     child.on('error', (error) => {
         logger.error(`Failed to start Rust core (${bin}): ${error.message}`);
         logger.error('Build it with: cargo build --release');

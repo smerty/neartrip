@@ -5,6 +5,8 @@
 // Global variables for UI elements
 const stationModal = new bootstrap.Modal(document.getElementById('stationModal'));
 let refreshInterval;
+let configEditorLoaded = false;
+let configEditorLoading = false;
 
 // Map variables
 let map = null;
@@ -30,63 +32,54 @@ document.addEventListener('DOMContentLoaded', () => {
         updateServerInfoWithoutConfigRefresh();
     }, 5000);
 
-    // Show the appropriate tab based on URL hash
+    // Restore the page from the URL so refresh and back/forward keep the view
+    if (!window.location.hash) {
+        history.replaceState(null, '', '#stations');
+    }
     loadTabFromUrlHash();
+    window.addEventListener('hashchange', loadTabFromUrlHash);
 
     // Setup event listeners
     setupEventListeners();
 });
 
+const PAGES = ['home', 'stations', 'connections', 'map', 'settings'];
+
 /**
  * Load the appropriate tab based on the URL hash
  */
 function loadTabFromUrlHash() {
-    // Get the hash from the URL (without the # symbol)
-    const hash = window.location.hash.substring(1) || 'stations'; // Default to stations if no hash
-    
-    // Hide all sections
+    let hash = window.location.hash.substring(1);
+    if (!PAGES.includes(hash)) {
+        hash = 'stations';
+        history.replaceState(null, '', '#stations');
+    }
+
     document.querySelectorAll('#stations, #connections, #map, #settings').forEach(section => {
         section.style.display = 'none';
     });
-    
-    // Show appropriate sections based on hash
+
     if (hash === 'home') {
-        // For home, show both stations and connections sections
         document.getElementById('stations').style.display = 'block';
         document.getElementById('connections').style.display = 'block';
-        
-        // Highlight the stations tab
-        document.querySelectorAll('.navbar-nav .nav-link').forEach(navLink => {
-            navLink.classList.remove('active');
-        });
-        document.querySelector('.navbar-nav .nav-link[href="#stations"]').classList.add('active');
-    } else if (['stations', 'connections', 'map', 'settings'].includes(hash)) {
-        // For other valid hashes, show just that section
-        document.getElementById(hash).style.display = 'block';
-        
-        // Highlight the appropriate nav link
-        document.querySelectorAll('.navbar-nav .nav-link').forEach(navLink => {
-            navLink.classList.remove('active');
-        });
-        document.querySelector(`.navbar-nav .nav-link[href="#${hash}"]`).classList.add('active');
-        
-        // If showing map, make sure it renders correctly
-        if (hash === 'map' && map) {
-            setTimeout(() => {
-                map.invalidateSize();
-                updateMap();
-            }, 100);
-        }
     } else {
-        // If hash is invalid, default to stations
-        document.getElementById('stations').style.display = 'block';
-        document.getElementById('connections').style.display = 'block';
-        
-        // Highlight the stations tab
-        document.querySelectorAll('.navbar-nav .nav-link').forEach(navLink => {
-            navLink.classList.remove('active');
-        });
-        document.querySelector('.navbar-nav .nav-link[href="#stations"]').classList.add('active');
+        document.getElementById(hash).style.display = 'block';
+    }
+
+    const activeHref = hash === 'home' ? '#stations' : `#${hash}`;
+    document.querySelectorAll('.navbar-nav .nav-link').forEach(navLink => {
+        navLink.classList.toggle('active', navLink.getAttribute('href') === activeHref);
+    });
+
+    if (hash === 'map' && map) {
+        setTimeout(() => {
+            map.invalidateSize();
+            updateMap();
+        }, 100);
+    }
+
+    if (hash === 'settings' && !configEditorLoaded) {
+        loadConfigEditor();
     }
 }
 
@@ -112,43 +105,19 @@ function setupEventListeners() {    // Add station button
     document.getElementById('cancelConfigBtn').addEventListener('click', loadConfigEditor);
     document.getElementById('resetConfigBtn').addEventListener('click', resetToDefaultConfig);
 
-    // Navigation links
+    // Navigation links update the URL; hashchange renders the page
     document.querySelectorAll('.navbar-nav .nav-link, .navbar-brand').forEach(link => {
         link.addEventListener('click', function(e) {
+            const href = this.getAttribute('href') || '';
+            if (!href.startsWith('#')) return;
+
             e.preventDefault();
-            const targetId = this.getAttribute('href').substring(1);
-            
-            // Hide all sections
-            document.querySelectorAll('#stations, #connections, #map, #settings').forEach(section => {
-                section.style.display = 'none';
-            });
-            
-            // Show target section(s)
-            if (targetId === 'home') {
-                // For home, show both stations and connections sections
-                document.getElementById('stations').style.display = 'block';
-                document.getElementById('connections').style.display = 'block';
-            } else {
-                document.getElementById(targetId).style.display = 'block';
+            const targetId = href.substring(1);
+            if (window.location.hash === `#${targetId}`) {
+                loadTabFromUrlHash();
+                return;
             }
-            
-            // Update active nav link
-            document.querySelectorAll('.navbar-nav .nav-link').forEach(navLink => {
-                navLink.classList.remove('active');
-            });
-            
-            // If clicking the navbar brand, highlight the stations link
-            if (targetId === 'home') {
-                document.querySelector('.navbar-nav .nav-link[href="#stations"]').classList.add('active');
-            } else {
-                this.classList.add('active');
-            }
-            
-            // Refresh map if showing map view
-            if (targetId === 'map' && map) {
-                map.invalidateSize();
-                updateMap();
-            }
+            window.location.hash = targetId;
         });
     });
 }
@@ -175,11 +144,6 @@ async function loadServerInfo() {
             Mount Point: ${data.config.mountPoint} | 
             Stations: ${data.config.stations.length}
         `;
-        
-        // Load config editor if we're on the settings tab
-        if (document.getElementById('settings').style.display !== 'none') {
-            loadConfigEditor();
-        }
     } catch (error) {
         console.error('Error loading server info:', error);
         document.getElementById('serverInfo').innerHTML = `
@@ -570,6 +534,8 @@ async function updateServerInfoWithoutConfigRefresh() {
  * Load the configuration editor with the current config
  */
 async function loadConfigEditor() {
+    if (configEditorLoading) return;
+    configEditorLoading = true;
     try {
         const response = await fetch('/api/config');
         if (!response.ok) throw new Error('Failed to fetch configuration');
@@ -578,9 +544,12 @@ async function loadConfigEditor() {
         
         // Format the JSON with 2-space indentation for better readability
         document.getElementById('configEditor').value = JSON.stringify(config, null, 2);
+        configEditorLoaded = true;
     } catch (error) {
         console.error('Error loading configuration:', error);
         document.getElementById('configEditor').value = `Error loading configuration: ${error.message}`;
+    } finally {
+        configEditorLoading = false;
     }
 }
 

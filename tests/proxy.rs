@@ -566,3 +566,60 @@ async fn proxy_snapshots_are_isolated_and_cleaned_up() {
     assert!(!first_dir.exists());
     assert!(!second_dir.exists());
 }
+
+#[tokio::test]
+async fn non_reading_rover_times_out_even_when_correction_write_is_blocked() {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\r\n").await;
+        // Much larger than the proxy send buffer and rover receive window.
+        let chunk = [0xD3; 8192];
+        for _ in 0..4096 {
+            if socket.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(1024).unwrap();
+    let mut client = socket.connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    // Keep the rover socket open, but never read another byte. First verify
+    // real backpressure, so the test cannot pass on an empty/slow upstream.
+    let mut previous = wait_session(&proxy, |r| r["bytesSent"].as_u64().unwrap_or(0) > 65536).await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let current = wait_session(&proxy, |r| r["active"] == true).await;
+            if current["bytesSent"] == previous["bytesSent"] {
+                break;
+            }
+            previous = current;
+        }
+    })
+    .await
+    .expect("correction forwarding never reached backpressure");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::time::resume();
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "client idle timeout");
+    assert_eq!(ended["bytesSent"], previous["bytesSent"]);
+    drop(client);
+    proxy.stop();
+}

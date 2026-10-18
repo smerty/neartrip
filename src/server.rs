@@ -233,51 +233,59 @@ async fn stream(
     let mut client_deadline = tokio::time::Instant::now() + READ_IDLE;
 
     loop {
-        drain_lines(
-            &mut line_buf,
-            &configs,
-            registry,
-            live,
-            &mut upstream,
-            &mut client_write,
-            &mut last_fail,
-        )
-        .await;
-        let client_n = tokio::select! {
-            _ = tokio::time::sleep_until(client_deadline) => return Err("client idle timeout".into()),
-            n = client_read.read(&mut tmp) => Some(match n {
-                Ok(0) => Err("client closed".into()),
-                Ok(n) => Ok(n),
-                Err(err) => Err(err.to_string()),
-            }),
-            n = read_upstream(&mut upstream, &mut up_buf) => {
-                match n {
-                    Ok(0) => {
-                        registry.upstream(&live.id, "disconnected", Some("caster closed"));
-                        if let Some(link) = upstream.take() {
-                            last_fail = Some((link.mount, Instant::now()));
+        // Cover every await, including caster dialing/GGA writes and a
+        // backpressured correction write. Cancelling a partial write is safe:
+        // expiry ends this session rather than retrying the payload.
+        let deadline = client_deadline;
+        tokio::time::timeout_at(deadline, async {
+            drain_lines(
+                &mut line_buf,
+                &configs,
+                registry,
+                live,
+                &mut upstream,
+                &mut client_write,
+                &mut last_fail,
+            )
+            .await;
+            let client_n = tokio::select! {
+                n = client_read.read(&mut tmp) => Some(match n {
+                    Ok(0) => Err("client closed".into()),
+                    Ok(n) => Ok(n),
+                    Err(err) => Err(err.to_string()),
+                }),
+                n = read_upstream(&mut upstream, &mut up_buf) => {
+                    match n {
+                        Ok(0) => {
+                            registry.upstream(&live.id, "disconnected", Some("caster closed"));
+                            if let Some(link) = upstream.take() {
+                                last_fail = Some((link.mount, Instant::now()));
+                            }
+                        }
+                        Err(err) => {
+                            registry.upstream(&live.id, "error", Some(&err.to_string()));
+                            if let Some(link) = upstream.take() {
+                                last_fail = Some((link.mount, Instant::now()));
+                            }
+                        }
+                        Ok(n) => {
+                            client_write.write_all(&up_buf[..n]).await.map_err(|e| e.to_string())?;
+                            registry.add_bytes(&live.id, n as u64, 0);
                         }
                     }
-                    Err(err) => {
-                        registry.upstream(&live.id, "error", Some(&err.to_string()));
-                        if let Some(link) = upstream.take() {
-                            last_fail = Some((link.mount, Instant::now()));
-                        }
-                    }
-                    Ok(n) => {
-                        client_write.write_all(&up_buf[..n]).await.map_err(|e| e.to_string())?;
-                        registry.add_bytes(&live.id, n as u64, 0);
-                    }
+                    None
                 }
-                None
+            };
+            if let Some(n) = client_n {
+                let n = n?;
+                client_deadline = tokio::time::Instant::now() + READ_IDLE;
+                registry.add_bytes(&live.id, 0, n as u64);
+                line_buf.extend_from_slice(&tmp[..n]);
             }
-        };
-        if let Some(n) = client_n {
-            let n = n?;
-            client_deadline = tokio::time::Instant::now() + READ_IDLE;
-            registry.add_bytes(&live.id, 0, n as u64);
-            line_buf.extend_from_slice(&tmp[..n]);
-        }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| "client idle timeout".to_string())??;
     }
 }
 

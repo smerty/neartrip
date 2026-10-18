@@ -117,7 +117,12 @@ impl Registry {
                             .disconnected_at
                             .as_deref()
                             .and_then(parse_timestamp)
-                            .or(Some(now));
+                            .or_else(|| {
+                                // Persist the recovery time so another restart cannot
+                                // extend retention for the same malformed record.
+                                record.disconnected_at = Some(stamp.clone());
+                                Some(now)
+                            });
                         table.push(record);
                     }
                     table.prune(now);
@@ -280,6 +285,7 @@ impl Registry {
                     session.last_upstream_error = Some(error.into());
                 }
                 session.status = match status {
+                    "connected" if session.status == "streaming" => "streaming",
                     "connected" => "upstream_connected",
                     "connecting" => "connecting_upstream",
                     _ => "awaiting_upstream",
@@ -582,6 +588,47 @@ mod tests {
                 table.get_mut(&live.id).unwrap().disconnected_at,
                 records[0].disconnected_at
             )
+        });
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_disconnect_times_are_repaired_once_and_still_expire() {
+        let path = std::env::temp_dir().join(format!("neartrip-fallback-{}.json", session_id()));
+        let mut missing = record("missing", Some(1));
+        missing.disconnected_at = None;
+        let mut malformed = record("malformed", Some(1));
+        malformed.disconnected_at = Some("not a timestamp".into());
+        fs::write(
+            &path,
+            serde_json::to_vec(&vec![missing, malformed]).unwrap(),
+        )
+        .unwrap();
+        let registry = Registry::new(&path);
+        registry.flush();
+        let repaired: Vec<SessionRecord> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired.len(), 2);
+        for record in &repaired {
+            assert!(parse_timestamp(record.disconnected_at.as_deref().unwrap()).is_some());
+        }
+        let restored = Registry::new(&path);
+        restored.with_mut(|table| {
+            for (record, original) in table.records.iter().zip(&repaired) {
+                assert_eq!(record.disconnected_at, original.disconnected_at);
+                assert_eq!(
+                    record.disconnected_unix,
+                    original
+                        .disconnected_at
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                );
+            }
+            let cutoff = table.records[0].disconnected_unix.unwrap() + HISTORY_SECS;
+            table.prune(cutoff - 1);
+            assert_eq!(table.records.len(), 2);
+            table.prune(cutoff);
+            assert!(table.records.is_empty());
         });
         fs::remove_file(path).unwrap();
     }

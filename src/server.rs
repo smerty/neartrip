@@ -1,7 +1,8 @@
 //! One TCP session per rover.
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -368,7 +369,10 @@ async fn ensure_upstream(
             return;
         }
     }
-    registry.upstream(&live.id, "connecting", None);
+    // A switch attempt does not replace the working link until it succeeds.
+    if upstream.is_none() {
+        registry.upstream(&live.id, "connecting", None);
+    }
     match upstream::connect(&station, &config.user_agent).await {
         Ok(link) => {
             let (read, mut write) = link.stream.into_split();
@@ -386,6 +390,8 @@ async fn ensure_upstream(
                 *last_fail = Some((mount, Instant::now()));
                 return;
             }
+            // Reset streaming only for the newly established connection.
+            registry.upstream(&live.id, "connecting", None);
             registry.upstream(&live.id, "connected", None);
             if !link.pending.is_empty() {
                 if client_write.write_all(&link.pending).await.is_ok() {

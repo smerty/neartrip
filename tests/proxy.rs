@@ -205,6 +205,13 @@ struct Proxy {
     path: std::path::PathBuf,
 }
 
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        let _ = std::fs::remove_dir_all(self.path.parent().unwrap());
+    }
+}
+
 impl Proxy {
     fn stop(self) {
         let _ = self.shutdown.send(true);
@@ -241,11 +248,20 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
     let addr = listener.local_addr().unwrap();
     let (_config_tx, config_rx) = watch::channel(config);
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let registry = Arc::new(Registry::new(
-        std::env::temp_dir().join(format!("neartrip-sessions-{}.json", addr.port())),
+    static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "neartrip-proxy-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("sessions.json");
+    let registry = Arc::new(Registry::new(&path));
     let serve_registry = registry.clone();
-    let path = std::env::temp_dir().join(format!("neartrip-sessions-{}.json", addr.port()));
     tokio::spawn(async move {
         serve(listener, config_rx, serve_registry, shutdown_rx).await;
     });
@@ -454,4 +470,99 @@ async fn upstream_failure_is_visible_while_rover_remains_connected() {
     let ended = wait_session(&proxy, |r| r["active"] == false).await;
     assert_eq!(ended["disconnectReason"], "client closed");
     proxy.stop();
+}
+
+#[tokio::test]
+async fn failed_switch_preserves_streaming_until_the_upstream_is_replaced_or_dropped() {
+    let caster_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caster_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = caster_a.local_addr().unwrap().port();
+    let port_b = caster_b.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster_a.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\nAAAA").await.unwrap();
+        let mut buf = [0; 1024];
+        while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+    let (attempted, attempt) = tokio::sync::oneshot::channel();
+    let (reject, rejected) = tokio::sync::oneshot::channel();
+    let (close, closed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        attempted.send(()).unwrap();
+        rejected.await.unwrap();
+        socket
+            .write_all(b"HTTP/1.0 401 Unauthorized\r\n\r\n")
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\r\n").await;
+        let _ = closed.await;
+    });
+    let proxy = start_proxy(port_a, port_b).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"AAAA").await;
+    wait_session(&proxy, |r| r["status"] == "streaming").await;
+
+    let far = format!("{}\r\n", gga(37.9, -122.0));
+    client.write_all(far.as_bytes()).await.unwrap();
+    timeout(Duration::from_secs(3), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let during = wait_session(&proxy, |r| r["status"] == "streaming").await;
+    assert_eq!(during["upstreamStatus"], "connected");
+    reject.send(()).unwrap();
+    let failed = wait_session(&proxy, |r| {
+        r["lastUpstreamError"] == "caster rejected the mountpoint"
+    })
+    .await;
+    assert_eq!(failed["status"], "streaming");
+    assert_eq!(failed["upstreamStatus"], "connected");
+    assert_eq!(failed["currentStation"], "A");
+    assert_eq!(failed["bytesSent"], 4);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    client.write_all(far.as_bytes()).await.unwrap();
+    let replaced = wait_session(&proxy, |r| r["currentStation"] == "B").await;
+    assert_eq!(replaced["status"], "upstream_connected");
+    assert_eq!(replaced["bytesSent"], 4);
+    close.send(()).unwrap();
+    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "disconnected").await;
+    assert_eq!(dropped["status"], "awaiting_upstream");
+    assert_eq!(dropped["active"], true);
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn proxy_snapshots_are_isolated_and_cleaned_up() {
+    let first = start_proxy(9, 9).await;
+    std::fs::write(&first.path, b"[{\"id\":\"stale\",\"active\":false}]").unwrap();
+    let second = start_proxy(9, 9).await;
+    assert_ne!(first.path, second.path);
+    second.registry.flush();
+    assert_eq!(std::fs::read_to_string(&second.path).unwrap(), "[]");
+    let first_dir = first.path.parent().unwrap().to_path_buf();
+    let second_dir = second.path.parent().unwrap().to_path_buf();
+    first.stop();
+    second.stop();
+    assert!(!first_dir.exists());
+    assert!(!second_dir.exists());
 }

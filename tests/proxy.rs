@@ -653,7 +653,12 @@ async fn individual_accounts_and_reload_control_new_connections() {
             .unwrap();
         let response = read_until(&mut client, b"ICY 200 OK").await;
         assert!(String::from_utf8_lossy(&response).contains("ICY 200 OK"));
-        connected.push(client);
+        let port = client.local_addr().unwrap().port();
+        let session = wait_session(&proxy, |r| {
+            r["clientPort"] == port && r["active"] == true && r["authenticated"] == true
+        })
+        .await;
+        connected.push((client, session));
     }
     for credentials in [
         "alice:two",
@@ -684,9 +689,19 @@ async fn individual_accounts_and_reload_control_new_connections() {
         .await
         .unwrap();
     assert!(read_to_string(&mut client).await.contains("401"));
-    // Existing sockets remain usable after accounts are disabled.
-    for client in &mut connected {
-        client.write_all(b"$GPGSA,A,3\r\n").await.unwrap();
+    // Confirm the server processes new bytes on each original session after reload.
+    let sentence = b"$GPGSA,A,3\r\n";
+    for (client, original) in &mut connected {
+        client.write_all(sentence).await.unwrap();
+        let expected_bytes = original["bytesReceived"].as_u64().unwrap() + sentence.len() as u64;
+        let session = wait_session(&proxy, |r| {
+            r["id"] == original["id"]
+                && r["active"] == true
+                && r["bytesReceived"].as_u64().unwrap_or(0) >= expected_bytes
+        })
+        .await;
+        assert_eq!(session["authenticated"], true);
+        assert_eq!(session["bytesReceived"], expected_bytes);
     }
     proxy.stop();
 }

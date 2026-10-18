@@ -37,7 +37,10 @@ async fn mountpoint_requires_the_configured_password() {
     let body = read_to_string(&mut client).await;
     assert!(body.contains("401"), "{body}");
     let accepted = timeout(Duration::from_millis(200), caster.accept()).await;
-    assert!(accepted.is_err(), "a rejected rover must not dial the caster");
+    assert!(
+        accepted.is_err(),
+        "a rejected rover must not dial the caster"
+    );
     proxy.stop();
 }
 
@@ -55,7 +58,8 @@ async fn split_gngga_is_forwarded_and_a_farther_fix_switches_caster() {
     let proxy = start_proxy(port_a, port_b).await;
     let mut client = TcpStream::connect(proxy.addr).await.unwrap();
     let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
-    let request = format!("GET /NEAR HTTP/1.0\r\nUser-Agent: test\r\nAuthorization: Basic {token}\r\n\r\n");
+    let request =
+        format!("GET /NEAR HTTP/1.0\r\nUser-Agent: test\r\nAuthorization: Basic {token}\r\n\r\n");
     client.write_all(request.as_bytes()).await.unwrap();
     let banner = read_until(&mut client, b"ICY 200 OK").await;
     assert!(banner.windows(4).any(|w| w == b"\r\n\r\n") || banner.ends_with(b"ICY 200 OK"));
@@ -115,9 +119,97 @@ async fn correction_bursts_larger_than_the_read_buffer_are_preserved() {
     proxy.stop();
 }
 
+async fn wait_session(
+    proxy: &Proxy,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            proxy.registry.flush();
+            let records: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&proxy.path).unwrap()).unwrap();
+            if let Some(record) = records
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| predicate(record))
+            {
+                return record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session state did not appear")
+}
+
+#[tokio::test]
+async fn accepted_socket_waiting_for_gga_times_out_with_a_reason() {
+    let proxy = start_proxy(9, 9).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    wait_session(&proxy, |r| {
+        r["status"] == "tcp_connected" && r["active"] == true
+    })
+    .await;
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    wait_session(&proxy, |r| {
+        r["status"] == "awaiting_gga" && r["authenticated"] == true
+    })
+    .await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::time::resume();
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "client idle timeout");
+    assert_eq!(ended["readIdleTimeoutSecs"], 120);
+    assert_eq!(ended["bytesSent"], 0);
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn streaming_rover_keeps_live_counts_and_shutdown_is_recorded() {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    spawn_caster(caster, b"RTCM", Arc::new(Mutex::new(Vec::new())));
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    let request = format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    let sentence = format!("{}\r\n", gga(37.0, -122.0));
+    client.write_all(sentence.as_bytes()).await.unwrap();
+    read_until(&mut client, b"RTCM").await;
+    let live = wait_session(&proxy, |r| r["status"] == "streaming").await;
+    assert_eq!(live["active"], true);
+    assert_eq!(live["bytesSent"], 4);
+    assert_eq!(live["bytesReceived"], request.len() + sentence.len());
+    assert_eq!(live["currentStation"], "A");
+    assert_eq!(live["upstreamStatus"], "connected");
+    assert!(live["lastGgaAt"].is_string());
+    proxy.shutdown.send(true).unwrap();
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "core shutdown");
+    assert_eq!(ended["bytesSent"], 4);
+}
+
 struct Proxy {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    registry: Arc<Registry>,
+    path: std::path::PathBuf,
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        let _ = std::fs::remove_dir_all(self.path.parent().unwrap());
+    }
 }
 
 impl Proxy {
@@ -156,14 +248,29 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
     let addr = listener.local_addr().unwrap();
     let (_config_tx, config_rx) = watch::channel(config);
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let registry = Arc::new(Registry::new(std::env::temp_dir().join(format!(
-        "neartrip-sessions-{}.json",
-        addr.port()
-    ))));
+    static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "neartrip-proxy-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("sessions.json");
+    let registry = Arc::new(Registry::new(&path));
+    let serve_registry = registry.clone();
     tokio::spawn(async move {
-        serve(listener, config_rx, registry, shutdown_rx).await;
+        serve(listener, config_rx, serve_registry, shutdown_rx).await;
     });
-    Proxy { addr, shutdown }
+    Proxy {
+        addr,
+        shutdown,
+        registry,
+        path,
+    }
 }
 
 fn spawn_caster(listener: TcpListener, payload: &'static [u8], seen: Arc<Mutex<Vec<u8>>>) {
@@ -177,7 +284,8 @@ fn spawn_caster(listener: TcpListener, payload: &'static [u8], seen: Arc<Mutex<V
                 let mut buf = vec![0; 2048];
                 let mut acc = Vec::new();
                 loop {
-                    let Ok(Ok(n)) = timeout(Duration::from_secs(2), socket.read(&mut buf)).await else {
+                    let Ok(Ok(n)) = timeout(Duration::from_secs(2), socket.read(&mut buf)).await
+                    else {
                         return;
                     };
                     if n == 0 {
@@ -193,7 +301,8 @@ fn spawn_caster(listener: TcpListener, payload: &'static [u8], seen: Arc<Mutex<V
                 }
                 let mut gga = Vec::new();
                 loop {
-                    let Ok(Ok(n)) = timeout(Duration::from_secs(2), socket.read(&mut buf)).await else {
+                    let Ok(Ok(n)) = timeout(Duration::from_secs(2), socket.read(&mut buf)).await
+                    else {
                         return;
                     };
                     if n == 0 {
@@ -217,7 +326,10 @@ async fn read_until(socket: &mut TcpStream, needle: &[u8]) -> Vec<u8> {
     let mut buf = [0u8; 1024];
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while acc.windows(needle.len()).all(|window| window != needle) {
-        assert!(std::time::Instant::now() < deadline, "timed out waiting for {needle:?} in {acc:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {needle:?} in {acc:?}"
+        );
         let n = timeout(Duration::from_secs(3), socket.read(&mut buf))
             .await
             .expect("read timed out")
@@ -259,4 +371,255 @@ fn nmea_coord(degrees: f64, degree_digits: usize) -> String {
     let whole = degrees.floor();
     let minutes = (degrees - whole) * 60.0;
     format!("{whole:0degree_digits$.0}{minutes:07.4}")
+}
+
+#[tokio::test]
+async fn long_lived_rover_stays_visible_and_corrections_do_not_reset_its_idle_timer() {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    let (send, mut receive) = tokio::sync::mpsc::channel::<()>(4);
+    tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        let (mut read, mut write) = socket.into_split();
+        tokio::spawn(async move {
+            let mut buf = [0; 1024];
+            while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        while receive.recv().await.is_some() {
+            if write.write_all(b"DATA").await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    let request = format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    let sentence = format!("{}\r\n", gga(37.0, -122.0));
+    client.write_all(sentence.as_bytes()).await.unwrap();
+    wait_session(&proxy, |r| r["upstreamStatus"] == "connected").await;
+    for i in 1..=3 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        client.write_all(sentence.as_bytes()).await.unwrap();
+        send.send(()).await.unwrap();
+        read_until(&mut client, b"DATA").await;
+        let state = wait_session(&proxy, |r| {
+            r["bytesSent"] == i * 4
+                && r["bytesReceived"] == request.len() + (i as usize + 1) * sentence.len()
+        })
+        .await;
+        assert_eq!(state["active"], true);
+        assert_eq!(state["status"], "streaming");
+    }
+    // Correction traffic keeps the upstream alive, but must not indefinitely
+    // postpone the rover's requirement to send another position.
+    for _ in 0..2 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        tokio::time::resume();
+        send.send(()).await.unwrap();
+        read_until(&mut client, b"DATA").await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    tokio::time::resume();
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "client idle timeout");
+    assert_eq!(ended["bytesSent"], 20);
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn upstream_failure_is_visible_while_rover_remains_connected() {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket
+            .write_all(b"HTTP/1.0 401 Unauthorized\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(
+            format!(
+                "GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n{}\r\n",
+                gga(37.0, -122.0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    let state = wait_session(&proxy, |r| r["upstreamStatus"] == "error").await;
+    assert_eq!(state["active"], true);
+    assert_eq!(state["status"], "awaiting_upstream");
+    assert_eq!(state["lastUpstreamError"], "caster rejected the mountpoint");
+    assert_eq!(state["bytesSent"], 0);
+    drop(client);
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "client closed");
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn failed_switch_preserves_streaming_until_the_upstream_is_replaced_or_dropped() {
+    let caster_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caster_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = caster_a.local_addr().unwrap().port();
+    let port_b = caster_b.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster_a.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\nAAAA").await.unwrap();
+        let mut buf = [0; 1024];
+        while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+    let (attempted, attempt) = tokio::sync::oneshot::channel();
+    let (reject, rejected) = tokio::sync::oneshot::channel();
+    let (close, closed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        attempted.send(()).unwrap();
+        rejected.await.unwrap();
+        socket
+            .write_all(b"HTTP/1.0 401 Unauthorized\r\n\r\n")
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\r\n").await;
+        let _ = closed.await;
+    });
+    let proxy = start_proxy(port_a, port_b).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"AAAA").await;
+    wait_session(&proxy, |r| r["status"] == "streaming").await;
+
+    let far = format!("{}\r\n", gga(37.9, -122.0));
+    client.write_all(far.as_bytes()).await.unwrap();
+    timeout(Duration::from_secs(3), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let during = wait_session(&proxy, |r| r["status"] == "streaming").await;
+    assert_eq!(during["upstreamStatus"], "connected");
+    reject.send(()).unwrap();
+    let failed = wait_session(&proxy, |r| {
+        r["lastUpstreamError"] == "caster rejected the mountpoint"
+    })
+    .await;
+    assert_eq!(failed["status"], "streaming");
+    assert_eq!(failed["upstreamStatus"], "connected");
+    assert_eq!(failed["currentStation"], "A");
+    assert_eq!(failed["bytesSent"], 4);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    client.write_all(far.as_bytes()).await.unwrap();
+    let replaced = wait_session(&proxy, |r| r["currentStation"] == "B").await;
+    assert_eq!(replaced["status"], "upstream_connected");
+    assert_eq!(replaced["bytesSent"], 4);
+    close.send(()).unwrap();
+    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "disconnected").await;
+    assert_eq!(dropped["status"], "awaiting_upstream");
+    assert_eq!(dropped["active"], true);
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn proxy_snapshots_are_isolated_and_cleaned_up() {
+    let first = start_proxy(9, 9).await;
+    std::fs::write(&first.path, b"[{\"id\":\"stale\",\"active\":false}]").unwrap();
+    let second = start_proxy(9, 9).await;
+    assert_ne!(first.path, second.path);
+    second.registry.flush();
+    assert_eq!(std::fs::read_to_string(&second.path).unwrap(), "[]");
+    let first_dir = first.path.parent().unwrap().to_path_buf();
+    let second_dir = second.path.parent().unwrap().to_path_buf();
+    first.stop();
+    second.stop();
+    assert!(!first_dir.exists());
+    assert!(!second_dir.exists());
+}
+
+#[tokio::test]
+async fn non_reading_rover_times_out_even_when_correction_write_is_blocked() {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\r\n").await;
+        // Much larger than the proxy send buffer and rover receive window.
+        let chunk = [0xD3; 8192];
+        for _ in 0..4096 {
+            if socket.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(1024).unwrap();
+    let mut client = socket.connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    // Keep the rover socket open, but never read another byte. First verify
+    // real backpressure, so the test cannot pass on an empty/slow upstream.
+    let mut previous = wait_session(&proxy, |r| r["bytesSent"].as_u64().unwrap_or(0) > 65536).await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let current = wait_session(&proxy, |r| r["active"] == true).await;
+            if current["bytesSent"] == previous["bytesSent"] {
+                break;
+            }
+            previous = current;
+        }
+    })
+    .await
+    .expect("correction forwarding never reached backpressure");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::time::resume();
+    let ended = wait_session(&proxy, |r| r["active"] == false).await;
+    assert_eq!(ended["disconnectReason"], "client idle timeout");
+    assert_eq!(ended["bytesSent"], previous["bytesSent"]);
+    drop(client);
+    proxy.stop();
 }

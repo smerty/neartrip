@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 
 const HISTORY_SECS: u64 = 7 * 24 * 60 * 60;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 struct SessionRecord {
     id: String,
     client_ip: String,
@@ -37,6 +37,13 @@ struct SessionRecord {
     bytes_sent: u64,
     bytes_received: u64,
     nmea_log_file: String,
+    status: String,
+    authenticated: bool,
+    upstream_status: String,
+    last_upstream_error: Option<String>,
+    last_gga_at: Option<String>,
+    disconnect_reason: Option<String>,
+    read_idle_timeout_secs: u64,
     #[serde(skip)]
     disconnected_unix: Option<u64>,
 }
@@ -67,10 +74,11 @@ impl SessionTable {
 
     fn prune(&mut self, now: u64) {
         let previous_len = self.records.len();
-        self.records.retain(|session| match session.disconnected_unix {
-            Some(then) => now.saturating_sub(then) < HISTORY_SECS,
-            None => true,
-        });
+        self.records
+            .retain(|session| match session.disconnected_unix {
+                Some(then) => now.saturating_sub(then) < HISTORY_SECS,
+                None => true,
+            });
         if self.records.len() != previous_len {
             self.by_id.clear();
             for (index, session) in self.records.iter().enumerate() {
@@ -92,9 +100,46 @@ impl Registry {
             let _ = fs::create_dir_all(dir);
         }
         let _ = fs::create_dir_all(Path::new("logs/connections"));
+        let mut table = SessionTable::default();
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<SessionRecord>>(&bytes) {
+                Ok(records) => {
+                    let (stamp, now) = now_unix();
+                    for mut record in records {
+                        if record.active {
+                            record.active = false;
+                            record.disconnected_at = Some(stamp.clone());
+                            record.disconnect_reason = Some("core restarted".into());
+                        }
+                        record.status = "disconnected".into();
+                        record.upstream_status = "disconnected".into();
+                        record.disconnected_unix = record
+                            .disconnected_at
+                            .as_deref()
+                            .and_then(parse_timestamp)
+                            .or_else(|| {
+                                // Persist the recovery time so another restart cannot
+                                // extend retention for the same malformed record.
+                                record.disconnected_at = Some(stamp.clone());
+                                Some(now)
+                            });
+                        table.push(record);
+                    }
+                    table.prune(now);
+                }
+                Err(err) => {
+                    // Preserve the evidence before the startup snapshot replaces it.
+                    let backup = path.with_extension(format!("json.corrupt-{}", session_id()));
+                    fs::copy(&path, &backup).expect("cannot preserve invalid session history");
+                    tracing::warn!(%err, path = %backup.display(), "invalid session history preserved");
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("cannot read session history {}: {err}", path.display()),
+        }
         Self {
             path,
-            inner: Mutex::new(SessionTable::default()),
+            inner: Mutex::new(table),
             flush_lock: Mutex::new(()),
             changed: Notify::new(),
         }
@@ -119,7 +164,10 @@ impl Registry {
                     _ = tokio::time::sleep_until(next_flush) => {}
                 }
                 let registry = Arc::clone(&registry);
-                if tokio::task::spawn_blocking(move || registry.flush()).await.is_err() {
+                if tokio::task::spawn_blocking(move || registry.flush())
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 next_flush = tokio::time::Instant::now() + interval;
@@ -171,7 +219,11 @@ impl Registry {
                 bytes_sent: 0,
                 bytes_received: 0,
                 nmea_log_file,
+                status: "tcp_connected".into(),
+                upstream_status: "disconnected".into(),
+                read_idle_timeout_secs: 120,
                 disconnected_unix: None,
+                ..SessionRecord::default()
             });
         });
         self.changed.notify_one();
@@ -181,6 +233,7 @@ impl Registry {
     pub fn position(&self, id: &str, lat: f64, lon: f64, fix_quality: u32, satellites: u32) {
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
+                session.last_gga_at = Some(now_unix().0);
                 session.latitude = Some(lat);
                 session.longitude = Some(lon);
                 session.fix_quality = Some(fix_quality);
@@ -201,6 +254,9 @@ impl Registry {
     pub fn add_bytes(&self, id: &str, sent: u64, received: u64) {
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
+                if sent > 0 {
+                    session.status = "streaming".into();
+                }
                 session.bytes_sent += sent;
                 session.bytes_received += received;
             }
@@ -211,11 +267,47 @@ impl Registry {
         let _ = session.nmea.try_send(format!("{sentence}\n"));
     }
 
+    pub fn authenticated(&self, id: &str) {
+        self.with_mut(|sessions| {
+            if let Some(session) = sessions.get_mut(id) {
+                session.authenticated = true;
+                session.status = "awaiting_gga".into();
+            }
+        });
+        self.changed.notify_one();
+    }
+
+    pub fn upstream(&self, id: &str, status: &str, error: Option<&str>) {
+        self.with_mut(|sessions| {
+            if let Some(session) = sessions.get_mut(id) {
+                session.upstream_status = status.into();
+                if let Some(error) = error {
+                    session.last_upstream_error = Some(error.into());
+                }
+                session.status = match status {
+                    "connected" if session.status == "streaming" => "streaming",
+                    "connected" => "upstream_connected",
+                    "connecting" => "connecting_upstream",
+                    _ => "awaiting_upstream",
+                }
+                .into();
+            }
+        });
+        self.changed.notify_one();
+    }
+
     pub fn close(&self, id: &str) {
+        self.close_with_reason(id, "client closed");
+    }
+
+    pub fn close_with_reason(&self, id: &str, reason: &str) {
         let (stamp, unix) = now_unix();
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
                 session.active = false;
+                session.status = "disconnected".into();
+                session.upstream_status = "disconnected".into();
+                session.disconnect_reason = Some(reason.into());
                 session.disconnected_at = Some(stamp);
                 session.disconnected_unix = Some(unix);
             }
@@ -226,7 +318,10 @@ impl Registry {
     pub fn flush(&self) {
         // Serialize writers to the shared temporary path, without holding the
         // session lock during serialization or filesystem I/O.
-        let _writer = self.flush_lock.lock().unwrap_or_else(|err| err.into_inner());
+        let _writer = self
+            .flush_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let snapshot = self.with_mut(|sessions| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -302,6 +397,53 @@ fn unix_to_rfc3339(secs: u64, millis: u32) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+// Read the UTC timestamps emitted by older versions, which had no persisted
+// epoch field. Reject malformed dates instead of keeping them forever.
+fn parse_timestamp(value: &str) -> Option<u64> {
+    let date = value.get(..19)?;
+    let parts: Vec<u64> = date
+        .split(['-', 'T', ':'])
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [year, month, day, hour, minute, second] = parts.as_slice() else {
+        return None;
+    };
+    if !(1970..=9999).contains(year)
+        || !(1..=12).contains(month)
+        || *hour > 23
+        || *minute > 59
+        || *second > 59
+    {
+        return None;
+    }
+    let leap = |y: u64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let months = [
+        31,
+        if leap(*year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if *day == 0 || *day > months[*month as usize - 1] {
+        return None;
+    }
+    let days: u64 = (1970..*year)
+        .map(|y| if leap(y) { 366 } else { 365 })
+        .sum::<u64>()
+        + months[..*month as usize - 1].iter().sum::<u64>()
+        + day
+        - 1;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 /// Howard Hinnant's civil_from_days. `days` is days since 1970-01-01.
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
@@ -338,6 +480,7 @@ mod tests {
             bytes_received: 0,
             nmea_log_file: "test.nmea.log".into(),
             disconnected_unix: disconnected,
+            ..SessionRecord::default()
         }
     }
 
@@ -361,8 +504,12 @@ mod tests {
     #[test]
     fn concurrent_counters_and_snapshots_preserve_the_admin_schema() {
         let path = std::env::temp_dir().join(format!(
-            "neartrip-registry-test-{}-{}.json", std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            "neartrip-registry-test-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let registry = std::sync::Arc::new(Registry::new(&path));
         registry.with_mut(|table| table.push(record("rover", None)));
@@ -394,6 +541,146 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn restart_preserves_history_counters_and_recovers_interrupted_sessions() {
+        let path = std::env::temp_dir().join(format!("neartrip-restart-{}.json", session_id()));
+        let registry = Registry::new(&path);
+        let live = registry.open("127.0.0.1:1234".parse().unwrap()).await;
+        registry.authenticated(&live.id);
+        registry.position(&live.id, 0.0, 0.0, 4, 12);
+        registry.add_bytes(&live.id, 100, 200);
+        registry.with_mut(|table| {
+            let mut expired = record("expired", Some(1));
+            expired.disconnected_at = Some(unix_to_rfc3339(1, 0));
+            table.push(expired);
+            let mut recent = record("recent", Some(now_unix().1));
+            recent.disconnected_at = Some(now_unix().0);
+            recent.disconnect_reason = Some("client closed".into());
+            table.push(recent);
+        });
+        // Serialize directly so the loader must prune an expired legacy entry.
+        fs::write(
+            &path,
+            registry.with_mut(|table| serde_json::to_vec(&table.records).unwrap()),
+        )
+        .unwrap();
+        let restored = Registry::new(&path);
+        restored.flush();
+        let records: Vec<SessionRecord> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, live.id);
+        assert!(!records[0].active);
+        assert_eq!(
+            records[0].disconnect_reason.as_deref(),
+            Some("core restarted")
+        );
+        assert_eq!(records[0].bytes_sent, 100);
+        assert_eq!(records[0].bytes_received, 200);
+        assert_eq!(records[0].latitude, Some(0.0));
+        assert_eq!(
+            records[1].disconnect_reason.as_deref(),
+            Some("client closed")
+        );
+        let again = Registry::new(&path);
+        again.with_mut(|table| {
+            assert_eq!(
+                table.get_mut(&live.id).unwrap().disconnected_at,
+                records[0].disconnected_at
+            )
+        });
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_disconnect_times_are_repaired_once_and_still_expire() {
+        let path = std::env::temp_dir().join(format!("neartrip-fallback-{}.json", session_id()));
+        let mut missing = record("missing", Some(1));
+        missing.disconnected_at = None;
+        let mut malformed = record("malformed", Some(1));
+        malformed.disconnected_at = Some("not a timestamp".into());
+        fs::write(
+            &path,
+            serde_json::to_vec(&vec![missing, malformed]).unwrap(),
+        )
+        .unwrap();
+        let registry = Registry::new(&path);
+        registry.flush();
+        let repaired: Vec<SessionRecord> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired.len(), 2);
+        for record in &repaired {
+            assert!(parse_timestamp(record.disconnected_at.as_deref().unwrap()).is_some());
+        }
+        let restored = Registry::new(&path);
+        restored.with_mut(|table| {
+            for (record, original) in table.records.iter().zip(&repaired) {
+                assert_eq!(record.disconnected_at, original.disconnected_at);
+                assert_eq!(
+                    record.disconnected_unix,
+                    original
+                        .disconnected_at
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                );
+            }
+            let cutoff = table.records[0].disconnected_unix.unwrap() + HISTORY_SECS;
+            table.prune(cutoff - 1);
+            assert_eq!(table.records.len(), 2);
+            table.prune(cutoff);
+            assert!(table.records.is_empty());
+        });
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_history_is_preserved_before_the_first_snapshot() {
+        let dir = std::env::temp_dir().join(format!("neartrip-corrupt-{}", session_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let invalid = b"[{truncated";
+        fs::write(&path, invalid).unwrap();
+        let registry = Registry::new(&path);
+        registry.flush();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[]");
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p != &path)
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), invalid);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_utc_dates_round_trip_including_leap_days() {
+        for secs in [0, 951782400, 1700000000, 1792300000] {
+            assert_eq!(parse_timestamp(&unix_to_rfc3339(secs, 123)), Some(secs));
+        }
+        assert_eq!(parse_timestamp("2025-02-29T00:00:00.000Z"), None);
+    }
+
+    #[test]
+    fn active_sessions_older_than_history_keep_counters_and_diagnostics() {
+        let registry =
+            Registry::new(std::env::temp_dir().join(format!("neartrip-old-{}.json", session_id())));
+        registry.with_mut(|table| {
+            table.push(record("rover", None));
+            table.prune(HISTORY_SECS * 2);
+        });
+        registry.authenticated("rover");
+        registry.position("rover", 37.0, -122.0, 4, 12);
+        registry.upstream("rover", "connected", None);
+        registry.add_bytes("rover", 4096, 80);
+        registry.with_mut(|table| {
+            let rover = table.get_mut("rover").unwrap();
+            assert!(rover.active && rover.authenticated);
+            assert_eq!(rover.status, "streaming");
+            assert_eq!(rover.bytes_sent, 4096);
+            assert!(rover.last_gga_at.is_some());
+        });
+    }
+
     #[test]
     fn epoch_formats_as_utc() {
         assert_eq!(unix_to_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
@@ -404,7 +691,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "neartrip-live-{}-{}.json",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let registry = std::sync::Arc::new(Registry::new(&path));
         registry.start_snapshots();

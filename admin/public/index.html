@@ -134,6 +134,8 @@
             </div>
         </div>        <div id="connections" class="mb-4">
             <h2>Connections (Last 7 Days)</h2>
+            <p id="connectionSummary" aria-live="polite"></p>
+            <p>Rovers are accepted NTRIP clients. Streaming means correction bytes have been forwarded on the current upstream connection. Refreshes every 5 seconds.</p>
             <div class="connection-list">                <table id="connectionsTable" class="table table-striped table-hover">
                     <thead>
                         <tr>
@@ -147,8 +149,12 @@
                             <th>Longitude</th>
                             <th>Fix Quality</th>
                             <th>Satellites</th>
-                            <th>Sent</th>
+                            <th>RTCM Sent</th>
                             <th>Received</th>
+                            <th>Last GGA</th>
+                            <th>Upstream / Last Error</th>
+                            <th>Read Idle Timeout</th>
+                            <th>Disconnect Reason</th>
                             <th>Logs</th>
                         </tr>
                     </thead>

@@ -204,6 +204,21 @@ async function loadStations() {
     }
 }
 
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[char]));
+}
+
+function connectionCounts(connections) {
+    const active = connections.filter(conn => conn.active === true);
+    return {
+        tcp: active.length,
+        rovers: active.filter(conn => conn.authenticated === true).length,
+        streaming: active.filter(conn => conn.status === 'streaming' && conn.upstreamStatus === 'connected').length,
+    };
+}
+
 /**
  * Load active connections
  */
@@ -214,11 +229,14 @@ async function loadConnections() {
         
         const connections = await response.json();
         
+        const counts = connectionCounts(connections);
+        document.getElementById('connectionSummary').textContent =
+            `${counts.tcp} connected sockets · ${counts.rovers} active rovers · ${counts.streaming} streaming`;
         const tableBody = document.querySelector('#connectionsTable tbody');
         tableBody.innerHTML = '';
         
         if (connections.length === 0) {
-            tableBody.innerHTML = '<tr><td colspan="13" class="text-center">No connections found</td></tr>';
+            tableBody.innerHTML = '<tr><td colspan="17" class="text-center">No connections found</td></tr>';
             return;
         }
         
@@ -237,18 +255,23 @@ async function loadConnections() {
                 <td>
                     <span class="status-indicator ${isActive ? 'status-active' : 'status-inactive'}" 
                           title="${isActive ? 'Active' : 'Inactive'}"></span>
+                    ${escapeHtml(conn.status || (isActive ? 'connected' : 'disconnected'))}
                 </td>
                 <td>${conn.id.substring(0, 8)}...</td>
                 <td>${conn.clientIp}</td>
                 <td>${formatTimestamp(conn.connectedAt)}</td>
                 <td>${conn.disconnectedAt ? formatTimestamp(conn.disconnectedAt) : '-'}</td>
                 <td>${conn.currentStation || '-'}</td>
-                <td>${conn.latitude ? conn.latitude.toFixed(6) : '-'}</td>
-                <td>${conn.longitude ? conn.longitude.toFixed(6) : '-'}</td>
+                <td>${conn.latitude != null ? conn.latitude.toFixed(6) : '-'}</td>
+                <td>${conn.longitude != null ? conn.longitude.toFixed(6) : '-'}</td>
                 <td>${getFixQualityText(conn.fixQuality)}</td>
                 <td>${conn.numSatellites !== undefined ? conn.numSatellites : '-'}</td>
                 <td>${formatBytes(conn.bytesSent)}</td>
                 <td>${formatBytes(conn.bytesReceived)}</td>
+                <td>${conn.lastGgaAt ? formatTimestamp(conn.lastGgaAt) : '-'}</td>
+                <td>${escapeHtml(conn.upstreamStatus || '-')}<br>${escapeHtml(conn.lastUpstreamError || '')}</td>
+                <td>${conn.readIdleTimeoutSecs || '-'} s</td>
+                <td>${escapeHtml(conn.disconnectReason || '-')}</td>
                 <td>
                     <a href="/api/connections/${conn.id}/nmea-log" class="btn btn-sm btn-info" 
                        download="connection-${conn.id}.nmea.log">Download</a>
@@ -259,7 +282,7 @@ async function loadConnections() {
     } catch (error) {
         console.error('Error loading connections:', error);
         document.querySelector('#connectionsTable tbody').innerHTML = `
-            <tr><td colspan="13" class="text-center text-danger">Error loading connections: ${error.message}</td></tr>
+            <tr><td colspan="17" class="text-center text-danger">Error loading connections: ${error.message}</td></tr>
         `;
     }
     
@@ -355,7 +378,7 @@ function formatTimestamp(timestamp) {
     const minutes = date.getMinutes().toString().padStart(2, '0');
     const seconds = date.getSeconds().toString().padStart(2, '0');
     
-    return `${hours}:${minutes}:${seconds}`;
+    return `${date.toLocaleDateString()} ${hours}:${minutes}:${seconds}`;
 }
 
 /**

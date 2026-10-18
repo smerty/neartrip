@@ -121,3 +121,29 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Connection diagnostics
+
+The Rust core publishes `logs/sessions.json` at most once a second; the admin
+Connections view refreshes every five seconds. Connected sockets include TCP
+probes. Active rovers have passed the mountpoint/authentication checks, including
+when authentication is disabled. A streaming rover has forwarded correction bytes
+on its current upstream connection. `bytesSent` counts correction payload only;
+`bytesReceived` includes the request and NMEA data.
+
+Clients wait for a valid GGA before a station can be selected. The view exposes
+last GGA time, upstream state and last error, the 120-second inbound idle limit,
+and the reason a session ended. Correction traffic does not reset the client's
+inbound idle timer. Timestamps include the local date so seven-day history is
+unambiguous.
+
+History survives restarts, retaining disconnected sessions for seven days from
+their disconnect time. Sessions still marked active at startup are recovered as
+interrupted (`core restarted`). Orderly shutdown records `core shutdown`. Invalid
+history is preserved beside the snapshot as `sessions.json.corrupt-<id>` before
+starting a fresh table; unreadable history stops startup rather than overwriting
+it. Live sessions are retained regardless of age.
+
+Run the core and dashboard regression suites with `cargo test` and
+`npm run test:admin`. The core tests use local mock casters and virtual time to
+exercise long-lived rovers and idle timeouts without external NTRIP services.

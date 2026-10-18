@@ -10,7 +10,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:admin": "node tests/admin-config.cjs"
+    "test:admin": "node --test tests/*.cjs"
   },  "repository": {
     "type": "git",
     "url": "git+https://github.com/smerty/neartrip.git"

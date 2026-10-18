@@ -17,8 +17,7 @@ use tracing::info;
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -30,21 +29,18 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let listener = TcpListener::bind((config.interface.as_str(), config.port))
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("could not bind {}:{}: {err}", config.interface, config.port);
+            std::process::exit(1);
+        });
     let sessions_path = env::var("NEARTRIP_SESSIONS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("logs/sessions.json"));
     let registry = Arc::new(Registry::new(sessions_path));
     registry.flush();
 
-    let listener = TcpListener::bind((config.interface.as_str(), config.port))
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!(
-                "could not bind {}:{}: {err}",
-                config.interface, config.port
-            );
-            std::process::exit(1);
-        });
     info!(
         addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
         mount = %config.mount_point,
@@ -56,10 +52,14 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reload_path = path.clone();
     tokio::spawn(async move {
-        let mut last_modified = std::fs::metadata(&reload_path).and_then(|m| m.modified()).ok();
+        let mut last_modified = std::fs::metadata(&reload_path)
+            .and_then(|m| m.modified())
+            .ok();
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let modified = std::fs::metadata(&reload_path).and_then(|m| m.modified()).ok();
+            let modified = std::fs::metadata(&reload_path)
+                .and_then(|m| m.modified())
+                .ok();
             if modified == last_modified {
                 continue;
             }

@@ -75,7 +75,9 @@ function initAdminServer(options = {}) {
     
     // Schedule regular purging of old connections
     // Run every 6 hours (4 times per day)
-    setInterval(purgeOldConnections, 6 * 60 * 60 * 1000);
+    const purgeTimer = setInterval(purgeOldConnections, 6 * 60 * 60 * 1000);
+    purgeTimer.unref();
+    server.on('close', () => clearInterval(purgeTimer));
     logger.info(`Connection history purge scheduled every 6 hours (keeping ${CONNECTION_HISTORY_DAYS} days of history)`);
 
     return { app, server };
@@ -448,7 +450,8 @@ function purgeOldConnections() {
     
     let purgedCount = 0;
     connections.forEach((connection, id) => {
-        // Determine the date to compare (either disconnected date or connected date)
+        if (connection.active) return;
+        // Retain live sessions regardless of their age.
         const dateToCompare = connection.disconnectedAt 
             ? new Date(connection.disconnectedAt) 
             : new Date(connection.connectedAt);

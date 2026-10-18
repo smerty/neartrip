@@ -12,6 +12,8 @@ pub struct Config {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub users: Vec<User>,
     #[serde(default = "default_interface")]
     pub interface: String,
     #[serde(default = "default_port")]
@@ -22,6 +24,15 @@ pub struct Config {
     pub user_agent: String,
     #[serde(default)]
     pub stations: Vec<Station>,
+}
+
+/// Rover accounts. A nonempty list replaces the legacy shared credentials.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct User {
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -71,7 +82,7 @@ impl Config {
     }
 
     pub fn requires_auth(&self) -> bool {
-        !self.username.is_empty() || !self.password.is_empty()
+        !self.users.is_empty() || !self.username.is_empty() || !self.password.is_empty()
     }
 }
 

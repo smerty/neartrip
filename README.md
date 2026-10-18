@@ -105,6 +105,26 @@ npm start
 
 Set `username` and `password` in `config.json` to require those credentials on the virtual mountpoint. Leave both empty to accept unauthenticated rovers. The admin UI is still the Node process on `adminPort` (default 3000).
 
+### Multiple rover users
+
+Add a `users` array in the Settings configuration editor or `config.json`:
+
+```json
+"users": [
+  { "username": "tractor", "password": "tractor-secret" },
+  { "username": "survey", "password": "survey-secret", "active": true }
+]
+```
+
+Each rover uses its own login on the same virtual mountpoint. Concurrent rovers
+select stations independently from their own GGA positions. A nonempty `users`
+list replaces the legacy top-level `username` and `password`; only active users
+can connect. Set `active` to `false` to disable an account (defaults to `true`).
+An all-disabled list rejects every rover. Omit `users` or use `[]` to retain the
+legacy login behavior, including anonymous access when both legacy fields are
+empty. Account changes hot reload for new connections; existing sessions stay
+connected. These accounts grant rover access only; admin credentials are separate.
+
 ## How it Works
 
 1. Your GNSS receiver connects to NearTRIP as if it were a standard NTRIP server

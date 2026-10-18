@@ -13,6 +13,7 @@ const CONFIG_FILE_PATH = path.join(__dirname, '..', 'config.json');
 const DEFAULT_CONFIG = {
     username: "",
     password: "",
+    users: [],
     interface: "0.0.0.0",
     port: 2101,
     mountPoint: "NEAR-Default",

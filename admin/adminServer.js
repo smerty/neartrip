@@ -235,7 +235,7 @@ function setupApiRoutes(app) {
     app.get('/api/info', (req, res) => {
         try {
             const config = configManager.getConfig();
-            const { username, password, adminPassword, ...safeConfig } = config;
+            const { username, password, users, adminPassword, ...safeConfig } = config;
             res.json({
                 version: require('../package.json').version,
                 config: safeConfig,

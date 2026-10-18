@@ -201,6 +201,7 @@ async fn streaming_rover_keeps_live_counts_and_shutdown_is_recorded() {
 struct Proxy {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    configs: watch::Sender<Config>,
     registry: Arc<Registry>,
     path: std::path::PathBuf,
 }
@@ -246,7 +247,7 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
     let config = Config::parse(&raw).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (_config_tx, config_rx) = watch::channel(config);
+    let (config_tx, config_rx) = watch::channel(config);
     let (shutdown, shutdown_rx) = watch::channel(false);
     static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -266,6 +267,7 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
         serve(listener, config_rx, serve_registry, shutdown_rx).await;
     });
     Proxy {
+        configs: config_tx,
         addr,
         shutdown,
         registry,
@@ -621,5 +623,70 @@ async fn non_reading_rover_times_out_even_when_correction_write_is_blocked() {
     assert_eq!(ended["disconnectReason"], "client idle timeout");
     assert_eq!(ended["bytesSent"], previous["bytesSent"]);
     drop(client);
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn individual_accounts_and_reload_control_new_connections() {
+    let proxy = start_proxy(9, 9).await;
+    let config = Config::parse(
+        r#"{
+        "mountPoint":"NEAR", "username":"legacy", "password":"old",
+        "users":[
+            {"username":"alice","password":"one"},
+            {"username":"bob","password":"two"},
+            {"username":"disabled","password":"three","active":false}
+        ]
+    }"#,
+    )
+    .unwrap();
+    proxy.configs.send(config.clone()).unwrap();
+    let mut connected = Vec::new();
+    for credentials in ["alice:one", "bob:two"] {
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+        client
+            .write_all(
+                format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_until(&mut client, b"ICY 200 OK").await;
+        assert!(String::from_utf8_lossy(&response).contains("ICY 200 OK"));
+        connected.push(client);
+    }
+    for credentials in [
+        "alice:two",
+        "unknown:one",
+        "disabled:three",
+        "legacy:old",
+        "",
+    ] {
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+        client
+            .write_all(
+                format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(read_to_string(&mut client).await.contains("401"));
+    }
+    let mut disabled = config;
+    for user in &mut disabled.users {
+        user.active = false;
+    }
+    proxy.configs.send(disabled).unwrap();
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("alice:one");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_to_string(&mut client).await.contains("401"));
+    // Existing sockets remain usable after accounts are disabled.
+    for client in &mut connected {
+        client.write_all(b"$GPGSA,A,3\r\n").await.unwrap();
+    }
     proxy.stop();
 }

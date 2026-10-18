@@ -200,8 +200,15 @@ fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> bool {
     let Some((user, pass)) = auth else {
         return false;
     };
+    if !config.users.is_empty() {
+        return config.users.iter().fold(false, |matched, account| {
+            let credentials_match = ct_eq(user.as_bytes(), account.username.as_bytes())
+                & ct_eq(pass.as_bytes(), account.password.as_bytes());
+            matched | (account.active & credentials_match)
+        });
+    }
     ct_eq(user.as_bytes(), config.username.as_bytes())
-        && ct_eq(pass.as_bytes(), config.password.as_bytes())
+        & ct_eq(pass.as_bytes(), config.password.as_bytes())
 }
 
 fn ct_eq(left: &[u8], right: &[u8]) -> bool {

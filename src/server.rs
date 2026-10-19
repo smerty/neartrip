@@ -479,7 +479,9 @@ async fn ensure_upstream(
     if let Some((failed, when)) = last_fail {
         if failed == &mount && when.elapsed() < RETRY_AFTER {
             if let Err(err) = forward_gga(upstream, gga).await {
-                tracing::warn!(id = %live.id, mount = %mount, error = %err,
+                tracing::warn!(id = %live.id,
+                    mount = current_mount.as_deref().unwrap_or("unknown"),
+                    target_mount = %mount, error = %err,
                     "caster GGA write failed; reconnecting immediately");
                 *last_fail = None;
                 *upstream = None;

@@ -261,13 +261,19 @@ async fn stream(
             )
             .await;
             // Reuse the last valid position; recovery must not depend on a new GGA.
-            if upstream.is_none() {
+            let retry_due = last_fail.as_ref()
+                .is_some_and(|(_, when)| when.elapsed() >= RETRY_AFTER);
+            if retry_due {
+                // Consume the expired failure even if station selection changed.
+                last_fail = None;
+            }
+            if upstream.is_none() || retry_due {
                 if let Some(gga) = latest_gga.as_ref() {
                     ensure_upstream(&configs, registry, live, &mut upstream,
                         &mut client_write, &mut last_fail, gga).await;
                 }
             }
-            let retry_at = if upstream.is_none() && latest_gga.is_some() {
+            let retry_at = if latest_gga.is_some() {
                 last_fail.as_ref().map(|(_, when)| *when + RETRY_AFTER)
             } else {
                 None
@@ -418,7 +424,9 @@ async fn ensure_upstream(
     if let Some((failed, when)) = last_fail {
         if failed == &mount && when.elapsed() < RETRY_AFTER {
             if let Err(err) = forward_gga(upstream, gga).await {
-                tracing::warn!(id = %live.id, mount = %mount, error = %err, "caster GGA write failed");
+                tracing::warn!(id = %live.id, mount = %mount, error = %err,
+                    "caster GGA write failed; reconnecting immediately");
+                *last_fail = None;
                 *upstream = None;
                 registry.upstream(&live.id, "error", Some("caster GGA write failed"));
             }
@@ -544,4 +552,74 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_upstream_write_failure_clears_switch_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let (read, mut write) = socket.into_split();
+        // Force a deterministic write failure without relying on TCP reset timing.
+        write.shutdown().await.unwrap();
+        let mut upstream = Some(Upstream {
+            read,
+            write,
+            mount: "A".into(),
+            last_data: Instant::now(),
+            connected_at: Instant::now(),
+            session_id: "test".into(),
+            bytes_received: 0,
+        });
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_client_peer, addr) = listener.accept().await.unwrap();
+        let (_, mut client_write) = client.into_split();
+        let dir =
+            std::env::temp_dir().join(format!("neartrip-write-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Registry::new(dir.join("sessions.json"));
+        let live = registry.open(addr).await;
+        let config = Config::parse(r#"{"stations":[
+            {"mountPoint":"A","casterHost":"127.0.0.1","casterPort":9,"latitude":37,"longitude":-122},
+            {"mountPoint":"B","casterHost":"127.0.0.1","casterPort":9,"latitude":38,"longitude":-122}
+        ]}"#).unwrap();
+        let (_tx, configs) = watch::channel(config);
+        let gga = crate::nmea::Gga {
+            latitude: 38.0,
+            longitude: -122.0,
+            fix_quality: 2,
+            num_satellites: 12,
+            sentence: "$GPGGA,test".into(),
+        };
+        let mut last_fail = Some(("B".into(), Instant::now()));
+        ensure_upstream(
+            &configs,
+            &registry,
+            &live,
+            &mut upstream,
+            &mut client_write,
+            &mut last_fail,
+            &gga,
+        )
+        .await;
+        assert!(
+            upstream.is_none(),
+            "failed retained connection must be dropped"
+        );
+        assert!(
+            last_fail.is_none(),
+            "established write failure must allow immediate recovery"
+        );
+        drop(live);
+        drop(registry);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

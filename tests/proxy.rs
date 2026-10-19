@@ -542,7 +542,8 @@ async fn failed_switch_preserves_streaming_until_the_upstream_is_replaced_or_dro
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     tokio::time::resume();
-    client.write_all(far.as_bytes()).await.unwrap();
+    // The failed switch must retry using cached GGA while A remains connected.
+    // Send no additional rover bytes after the rejected switch.
     let replaced = wait_session(&proxy, |r| r["currentStation"] == "B").await;
     assert_eq!(replaced["status"], "upstream_connected");
     assert_eq!(replaced["bytesSent"], 4);

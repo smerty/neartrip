@@ -157,6 +157,19 @@ and the reason a session ended. Correction traffic does not reset the client's
 inbound idle timer. Timestamps include the local date so seven-day history is
 unambiguous.
 
+The core writes timestamped upstream events to stdout (inherited by Node and
+available through `docker compose logs` under Compose). Default `info` logging
+includes the rover connection `id`, mountpoint, dial attempts and results, first
+correction bytes, and read/write failures. Read failures include the OS error,
+connection lifetime, time since last correction bytes, and byte count. Match
+`id` to the Connections view. NMEA downloads still contain only NMEA sentences;
+the displayed last upstream error can remain visible after recovery.
+
+Established upstream connections that close or fail are redialed immediately
+using the latest valid GGA. Failed dial or initial GGA attempts retry after five
+seconds on a timer, without waiting for another rover sentence. Reusing GGA does
+not refresh the rover's 120-second inbound idle deadline.
+
 History survives restarts, retaining disconnected sessions for seven days from
 their disconnect time. Sessions still marked active at startup are recovered as
 interrupted (`core restarted`). Orderly shutdown records `core shutdown`. Invalid

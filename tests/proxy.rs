@@ -547,7 +547,8 @@ async fn failed_switch_preserves_streaming_until_the_upstream_is_replaced_or_dro
     assert_eq!(replaced["status"], "upstream_connected");
     assert_eq!(replaced["bytesSent"], 4);
     close.send(()).unwrap();
-    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "disconnected").await;
+    // Immediate redial fails because the mock caster listener has exited.
+    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "error").await;
     assert_eq!(dropped["status"], "awaiting_upstream");
     assert_eq!(dropped["active"], true);
     proxy.stop();
@@ -703,5 +704,86 @@ async fn individual_accounts_and_reload_control_new_connections() {
         assert_eq!(session["authenticated"], true);
         assert_eq!(session["bytesReceived"], expected_bytes);
     }
+    proxy.stop();
+}
+
+// No second rover GGA is sent: both recovery paths must run independently.
+#[tokio::test]
+async fn dropped_caster_reconnects_immediately_without_another_gga() {
+    check_autonomous_reconnect(false).await;
+}
+
+#[tokio::test]
+async fn rejected_caster_retries_on_timer_without_another_gga() {
+    check_autonomous_reconnect(true).await;
+}
+
+async fn check_autonomous_reconnect(reject_first: bool) {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    let expected_gga = gga(37.0, -122.0);
+    let forwarded_gga = expected_gga.clone();
+    let task = tokio::spawn(async move {
+        let (mut first, _) = caster.accept().await.unwrap();
+        read_until(&mut first, b"\r\n\r\n").await;
+        if reject_first {
+            first
+                .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n")
+                .await
+                .unwrap();
+        } else {
+            first.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+            read_until(&mut first, b"\n").await;
+            first.write_all(b"FIRST").await.unwrap();
+        }
+        drop(first);
+        let started = tokio::time::Instant::now();
+        let limit = Duration::from_secs(if reject_first { 7 } else { 2 });
+        let (mut second, _) = timeout(limit, caster.accept())
+            .await
+            .expect("proxy did not reconnect without another GGA")
+            .unwrap();
+        if reject_first {
+            assert!(
+                started.elapsed() >= Duration::from_millis(4900),
+                "retry ignored backoff"
+            );
+        }
+        read_until(&mut second, b"\r\n\r\n").await;
+        second.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        let gga = read_until(&mut second, b"\n").await;
+        assert_eq!(
+            String::from_utf8(gga).unwrap(),
+            format!("{forwarded_gga}\r\n")
+        );
+        second.write_all(b"RECOVERED").await.unwrap();
+        let mut buf = [0; 1];
+        let _ = second.read(&mut buf).await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{expected_gga}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(8), async {
+        while !received.windows(9).any(|bytes| bytes == b"RECOVERED") {
+            let mut buf = [0; 128];
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "rover disconnected during recovery");
+            received.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("corrections did not resume");
+    drop(client);
+    task.await.unwrap();
     proxy.stop();
 }

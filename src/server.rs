@@ -27,6 +27,9 @@ struct Upstream {
     write: OwnedWriteHalf,
     mount: String,
     last_data: tokio::time::Instant,
+    connected_at: Instant,
+    session_id: String,
+    bytes_received: u64,
 }
 
 pub async fn serve(
@@ -237,6 +240,7 @@ async fn stream(
     let mut up_buf = [0u8; 4096];
     let mut upstream: Option<Upstream> = None;
     let mut last_fail: Option<(String, Instant)> = None;
+    let mut latest_gga = None;
     let mut client_deadline = tokio::time::Instant::now() + READ_IDLE;
 
     loop {
@@ -253,9 +257,28 @@ async fn stream(
                 &mut upstream,
                 &mut client_write,
                 &mut last_fail,
+                &mut latest_gga,
             )
             .await;
+            // Reuse the last valid position; recovery must not depend on a new GGA.
+            if upstream.is_none() {
+                if let Some(gga) = latest_gga.as_ref() {
+                    ensure_upstream(&configs, registry, live, &mut upstream,
+                        &mut client_write, &mut last_fail, gga).await;
+                }
+            }
+            let retry_at = if upstream.is_none() && latest_gga.is_some() {
+                last_fail.as_ref().map(|(_, when)| *when + RETRY_AFTER)
+            } else {
+                None
+            };
             let client_n = tokio::select! {
+                _ = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 n = client_read.read(&mut tmp) => Some(match n {
                     Ok(0) => Err("client closed".into()),
                     Ok(n) => Ok(n),
@@ -266,13 +289,22 @@ async fn stream(
                         Ok(0) => {
                             registry.upstream(&live.id, "disconnected", Some("caster closed"));
                             if let Some(link) = upstream.take() {
-                                last_fail = Some((link.mount, Instant::now()));
+                                tracing::warn!(id = %live.id, mount = %link.mount,
+                                    uptime_ms = link.connected_at.elapsed().as_millis() as u64,
+                                    idle_ms = link.last_data.elapsed().as_millis() as u64,
+                                    bytes_received = link.bytes_received, "caster closed; reconnecting immediately");
+                                last_fail = None;
                             }
                         }
                         Err(err) => {
                             registry.upstream(&live.id, "error", Some(&err.to_string()));
                             if let Some(link) = upstream.take() {
-                                last_fail = Some((link.mount, Instant::now()));
+                                tracing::warn!(id = %live.id, mount = %link.mount, error = %err,
+                                    error_kind = ?err.kind(), os_error = ?err.raw_os_error(),
+                                    uptime_ms = link.connected_at.elapsed().as_millis() as u64,
+                                    idle_ms = link.last_data.elapsed().as_millis() as u64,
+                                    bytes_received = link.bytes_received, "caster read failed; reconnecting immediately");
+                                last_fail = None;
                             }
                         }
                         Ok(n) => {
@@ -304,6 +336,7 @@ async fn drain_lines(
     upstream: &mut Option<Upstream>,
     client_write: &mut OwnedWriteHalf,
     last_fail: &mut Option<(String, Instant)>,
+    latest_gga: &mut Option<crate::nmea::Gga>,
 ) {
     while let Some(split) = line_buf.iter().position(|byte| *byte == b'\n') {
         let raw: Vec<u8> = line_buf.drain(..=split).collect();
@@ -320,6 +353,7 @@ async fn drain_lines(
                 gga.fix_quality,
                 gga.num_satellites,
             );
+            *latest_gga = Some(gga.clone());
             ensure_upstream(
                 configs,
                 registry,
@@ -356,28 +390,35 @@ async fn ensure_upstream(
         SWITCH_MARGIN_M,
     ) else {
         *upstream = None;
+        // A config reload can remove the failed station while a retry is due.
+        // Clear its deadline so an unavailable position cannot spin the timer.
+        *last_fail = None;
         registry.upstream(
             &live.id,
             "unavailable",
             Some("no active station for this position"),
         );
-        tracing::warn!("no active station for this position");
+        tracing::warn!(id = %live.id, "no active station for this position");
         return;
     };
     let mount = chosen.station.mount_point.clone();
     let station = chosen.station.clone();
     let distance_m = chosen.distance_m;
     if current_mount.as_deref() == Some(mount.as_str()) {
-        if !forward_gga(upstream, gga).await {
+        if let Err(err) = forward_gga(upstream, gga).await {
             registry.upstream(&live.id, "error", Some("caster GGA write failed"));
-            *last_fail = Some((mount, Instant::now()));
+            tracing::warn!(id = %live.id, mount = %mount, error = %err,
+                error_kind = ?err.kind(), os_error = ?err.raw_os_error(),
+                "caster GGA write failed; reconnecting immediately");
+            *last_fail = None;
             *upstream = None;
         }
         return;
     }
     if let Some((failed, when)) = last_fail {
         if failed == &mount && when.elapsed() < RETRY_AFTER {
-            if !forward_gga(upstream, gga).await {
+            if let Err(err) = forward_gga(upstream, gga).await {
+                tracing::warn!(id = %live.id, mount = %mount, error = %err, "caster GGA write failed");
                 *upstream = None;
                 registry.upstream(&live.id, "error", Some("caster GGA write failed"));
             }
@@ -388,11 +429,16 @@ async fn ensure_upstream(
     if upstream.is_none() {
         registry.upstream(&live.id, "connecting", None);
     }
+    tracing::info!(id = %live.id, mount = %mount, host = %station.caster_host,
+        port = station.caster_port, previous_mount = ?current_mount, "caster connecting");
+    let attempt_started = Instant::now();
     match upstream::connect(&station, &config.user_agent).await {
         Ok(link) => {
             let (read, mut write) = link.stream.into_split();
             let line = format!("{}\r\n", gga.sentence);
-            if write.write_all(line.as_bytes()).await.is_err() {
+            if let Err(err) = write.write_all(line.as_bytes()).await {
+                tracing::warn!(id = %live.id, mount = %mount, error = %err,
+                    retry_after_secs = RETRY_AFTER.as_secs(), "initial caster GGA write failed");
                 registry.upstream(
                     &live.id,
                     if upstream.is_some() {
@@ -412,11 +458,14 @@ async fn ensure_upstream(
                 if client_write.write_all(&link.pending).await.is_ok() {
                     registry.add_bytes(&live.id, link.pending.len() as u64, 0);
                 } else {
+                    tracing::warn!(id = %live.id, mount = %mount, "client correction write failed");
                     registry.upstream(&live.id, "error", Some("client correction write failed"));
                     return;
                 }
             }
-            tracing::info!(mount = %station.mount_point, distance_m = distance_m.round(), "caster connected");
+            tracing::info!(id = %live.id, mount = %station.mount_point,
+                connect_ms = attempt_started.elapsed().as_millis() as u64,
+                initial_bytes = link.pending.len(), distance_m = distance_m.round(), "caster connected");
             registry.station(&live.id, &station.mount_point);
             *last_fail = None;
             *upstream = Some(Upstream {
@@ -424,6 +473,9 @@ async fn ensure_upstream(
                 write,
                 mount: station.mount_point,
                 last_data: tokio::time::Instant::now(),
+                connected_at: Instant::now(),
+                session_id: live.id.clone(),
+                bytes_received: link.pending.len() as u64,
             });
         }
         Err(err) => {
@@ -436,18 +488,21 @@ async fn ensure_upstream(
                 },
                 Some(&err),
             );
-            tracing::warn!(mount = %mount, %err, "caster connect failed");
+            tracing::warn!(id = %live.id, mount = %mount, %err, retry_after_secs = RETRY_AFTER.as_secs(), "caster connect failed");
             *last_fail = Some((mount, Instant::now()));
         }
     }
 }
 
-async fn forward_gga(upstream: &mut Option<Upstream>, gga: &crate::nmea::Gga) -> bool {
+async fn forward_gga(
+    upstream: &mut Option<Upstream>,
+    gga: &crate::nmea::Gga,
+) -> std::io::Result<()> {
     let Some(link) = upstream.as_mut() else {
-        return true;
+        return Ok(());
     };
     let line = format!("{}\r\n", gga.sentence);
-    link.write.write_all(line.as_bytes()).await.is_ok()
+    link.write.write_all(line.as_bytes()).await
 }
 
 async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -456,6 +511,12 @@ async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::
             match tokio::time::timeout_at(link.last_data + READ_IDLE, link.read.read(buf)).await {
                 Ok(result) => {
                     if matches!(result, Ok(n) if n > 0) {
+                        if link.bytes_received == 0 {
+                            tracing::info!(id = %link.session_id, mount = %link.mount,
+                                elapsed_ms = link.connected_at.elapsed().as_millis() as u64,
+                                "caster first correction bytes received");
+                        }
+                        link.bytes_received += result.as_ref().copied().unwrap_or(0) as u64;
                         link.last_data = tokio::time::Instant::now();
                     }
                     result

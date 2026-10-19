@@ -788,3 +788,81 @@ async fn check_autonomous_reconnect(reject_first: bool) {
     task.await.unwrap();
     proxy.stop();
 }
+
+#[tokio::test]
+async fn stalled_timer_switch_keeps_forwarding_retained_corrections() {
+    let caster_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caster_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = caster_a.local_addr().unwrap().port();
+    let port_b = caster_b.local_addr().unwrap().port();
+    let (send_bytes, send) = tokio::sync::oneshot::channel();
+    let a = tokio::spawn(async move {
+        let (mut socket, _) = caster_a.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\n").await;
+        socket.write_all(b"FIRST").await.unwrap();
+        send.await.unwrap();
+        socket.write_all(b"STILL_STREAMING").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (retry_started, retry) = tokio::sync::oneshot::channel();
+    let (release_headers, headers) = tokio::sync::oneshot::channel();
+    let b = tokio::spawn(async move {
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket
+            .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n")
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        retry_started.send(()).unwrap();
+        headers.await.unwrap();
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\n").await;
+        socket.write_all(b"REPLACED").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port_a, port_b).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"FIRST").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.9, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    // Send no further rover GGA: wait for the autonomous switch retry.
+    timeout(Duration::from_secs(8), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    send_bytes.send(()).unwrap();
+    timeout(
+        Duration::from_secs(1),
+        read_until(&mut client, b"STILL_STREAMING"),
+    )
+    .await
+    .expect("stalled replacement blocked working caster");
+    let retained = wait_session(&proxy, |r| {
+        r["currentStation"] == "A" && r["status"] == "streaming"
+    })
+    .await;
+    assert_eq!(retained["active"], true);
+    release_headers.send(()).unwrap();
+    read_until(&mut client, b"REPLACED").await;
+    wait_session(&proxy, |r| r["currentStation"] == "B").await;
+    proxy.stop();
+    a.abort();
+    b.abort();
+}

@@ -866,3 +866,77 @@ async fn stalled_timer_switch_keeps_forwarding_retained_corrections() {
     a.abort();
     b.abort();
 }
+
+#[tokio::test]
+async fn delayed_handshake_sends_latest_gga_without_a_third_fix() {
+    check_pending_gga_updates(false).await;
+}
+
+#[tokio::test]
+async fn batched_gga_sentences_coalesce_before_handshake_finishes() {
+    check_pending_gga_updates(true).await;
+}
+
+async fn check_pending_gga_updates(batched: bool) {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    let first = gga(37.0, -122.0);
+    let latest = gga(37.001, -122.0);
+    let expected = latest.clone();
+    let (requested, request_seen) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        requested.send(()).unwrap();
+        released.await.unwrap();
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        let sentence = read_until(&mut socket, b"\n").await;
+        assert_eq!(
+            String::from_utf8(sentence).unwrap(),
+            format!("{expected}\r\n")
+        );
+        socket.write_all(b"LATEST_FIX_RECEIVED").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    if batched {
+        client
+            .write_all(format!("{first}\r\n{latest}\r\n").as_bytes())
+            .await
+            .unwrap();
+    } else {
+        client
+            .write_all(format!("{first}\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(2), request_seen)
+        .await
+        .unwrap()
+        .unwrap();
+    if !batched {
+        client
+            .write_all(format!("{latest}\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    // Confirm the second fix has been consumed before releasing the caster header.
+    wait_session(&proxy, |r| {
+        r["latitude"]
+            .as_f64()
+            .is_some_and(|lat| (lat - 37.001).abs() < 0.000001)
+    })
+    .await;
+    release.send(()).unwrap();
+    read_until(&mut client, b"LATEST_FIX_RECEIVED").await;
+    proxy.stop();
+    task.abort();
+}

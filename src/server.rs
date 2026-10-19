@@ -35,6 +35,7 @@ struct Upstream {
 // Kept inside the session so dropping the session cancels the dial as well.
 struct ConnectAttempt {
     mount: String,
+    latest_gga: watch::Sender<String>,
     future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(Upstream, Vec<u8>), String>> + Send>,
     >,
@@ -487,7 +488,9 @@ async fn ensure_upstream(
             return;
         }
     }
-    if attempt.is_some() {
+    if let Some(pending) = attempt.as_mut() {
+        // Coalesce fixes while the handshake or a candidate GGA write is pending.
+        pending.latest_gga.send_replace(gga.sentence.clone());
         return;
     }
     if upstream.is_none() {
@@ -495,22 +498,33 @@ async fn ensure_upstream(
     }
     tracing::info!(id = %live.id, mount = %mount, host = %station.caster_host,
         port = station.caster_port, previous_mount = ?current_mount, "caster connecting");
-    let gga_sentence = gga.sentence.clone();
+    let (gga_tx, mut gga_rx) = watch::channel(gga.sentence.clone());
     let user_agent = config.user_agent;
     let session_id = live.id.clone();
     *attempt = Some(ConnectAttempt {
         mount,
+        latest_gga: gga_tx,
         future: Box::pin(async move {
             let started = Instant::now();
             let mut link = upstream::connect(&station, &user_agent).await?;
-            let line = format!("{}\r\n", gga_sentence);
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                link.stream.write_all(line.as_bytes()),
-            )
+            // Keep writes inside the candidate future, polled alongside retained
+            // correction reads. Catch updates arriving during a backpressured write
+            // before publishing the candidate as the active connection.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let sentence = gga_rx.borrow_and_update().clone();
+                    let line = format!("{sentence}\r\n");
+                    link.stream
+                        .write_all(line.as_bytes())
+                        .await
+                        .map_err(|err| format!("initial caster GGA write failed: {err}"))?;
+                    if !gga_rx.has_changed().unwrap_or(false) {
+                        return Ok::<(), String>(());
+                    }
+                }
+            })
             .await
-            .map_err(|_| "initial caster GGA write timed out".to_string())?
-            .map_err(|err| format!("initial caster GGA write failed: {err}"))?;
+            .map_err(|_| "initial caster GGA write timed out".to_string())??;
             tracing::info!(id = %session_id, mount = %station.mount_point,
                 connect_ms = started.elapsed().as_millis() as u64,
                 initial_bytes = link.pending.len(), distance_m = distance_m.round(), "caster connected");

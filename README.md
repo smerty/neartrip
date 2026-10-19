@@ -105,6 +105,26 @@ npm start
 
 Set `username` and `password` in `config.json` to require those credentials on the virtual mountpoint. Leave both empty to accept unauthenticated rovers. The admin UI is still the Node process on `adminPort` (default 3000).
 
+### Multiple rover users
+
+Add a `users` array in the Settings configuration editor or `config.json`:
+
+```json
+"users": [
+  { "username": "tractor", "password": "tractor-secret" },
+  { "username": "survey", "password": "survey-secret", "active": true }
+]
+```
+
+Each rover uses its own login on the same virtual mountpoint. Concurrent rovers
+select stations independently from their own GGA positions. A nonempty `users`
+list replaces the legacy top-level `username` and `password`; only active users
+can connect. Set `active` to `false` to disable an account (defaults to `true`).
+An all-disabled list rejects every rover. Omit `users` or use `[]` to retain the
+legacy login behavior, including anonymous access when both legacy fields are
+empty. Account changes hot reload for new connections; existing sessions stay
+connected. These accounts grant rover access only; admin credentials are separate.
+
 ## How it Works
 
 1. Your GNSS receiver connects to NearTRIP as if it were a standard NTRIP server
@@ -136,6 +156,19 @@ last GGA time, upstream state and last error, the 120-second inbound idle limit,
 and the reason a session ended. Correction traffic does not reset the client's
 inbound idle timer. Timestamps include the local date so seven-day history is
 unambiguous.
+
+The core writes timestamped upstream events to stdout (inherited by Node and
+available through `docker compose logs` under Compose). Default `info` logging
+includes the rover connection `id`, mountpoint, dial attempts and results, first
+correction bytes, and read/write failures. Read failures include the OS error,
+connection lifetime, time since last correction bytes, and byte count. Match
+`id` to the Connections view. NMEA downloads still contain only NMEA sentences;
+the displayed last upstream error can remain visible after recovery.
+
+Established upstream connections that close or fail are redialed immediately
+using the latest valid GGA. Failed dial or initial GGA attempts retry after five
+seconds on a timer, without waiting for another rover sentence. Reusing GGA does
+not refresh the rover's 120-second inbound idle deadline.
 
 History survives restarts, retaining disconnected sessions for seven days from
 their disconnect time. Sessions still marked active at startup are recovered as

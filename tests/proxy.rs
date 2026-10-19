@@ -201,6 +201,7 @@ async fn streaming_rover_keeps_live_counts_and_shutdown_is_recorded() {
 struct Proxy {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    configs: watch::Sender<Config>,
     registry: Arc<Registry>,
     path: std::path::PathBuf,
 }
@@ -246,7 +247,7 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
     let config = Config::parse(&raw).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (_config_tx, config_rx) = watch::channel(config);
+    let (config_tx, config_rx) = watch::channel(config);
     let (shutdown, shutdown_rx) = watch::channel(false);
     static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -266,6 +267,7 @@ async fn start_proxy(port_a: u16, port_b: u16) -> Proxy {
         serve(listener, config_rx, serve_registry, shutdown_rx).await;
     });
     Proxy {
+        configs: config_tx,
         addr,
         shutdown,
         registry,
@@ -540,12 +542,14 @@ async fn failed_switch_preserves_streaming_until_the_upstream_is_replaced_or_dro
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     tokio::time::resume();
-    client.write_all(far.as_bytes()).await.unwrap();
+    // The failed switch must retry using cached GGA while A remains connected.
+    // Send no additional rover bytes after the rejected switch.
     let replaced = wait_session(&proxy, |r| r["currentStation"] == "B").await;
     assert_eq!(replaced["status"], "upstream_connected");
     assert_eq!(replaced["bytesSent"], 4);
     close.send(()).unwrap();
-    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "disconnected").await;
+    // Immediate redial fails because the mock caster listener has exited.
+    let dropped = wait_session(&proxy, |r| r["upstreamStatus"] == "error").await;
     assert_eq!(dropped["status"], "awaiting_upstream");
     assert_eq!(dropped["active"], true);
     proxy.stop();
@@ -622,4 +626,323 @@ async fn non_reading_rover_times_out_even_when_correction_write_is_blocked() {
     assert_eq!(ended["bytesSent"], previous["bytesSent"]);
     drop(client);
     proxy.stop();
+}
+
+#[tokio::test]
+async fn individual_accounts_and_reload_control_new_connections() {
+    let proxy = start_proxy(9, 9).await;
+    let config = Config::parse(
+        r#"{
+        "mountPoint":"NEAR", "username":"legacy", "password":"old",
+        "users":[
+            {"username":"alice","password":"one"},
+            {"username":"bob","password":"two"},
+            {"username":"disabled","password":"three","active":false}
+        ]
+    }"#,
+    )
+    .unwrap();
+    proxy.configs.send(config.clone()).unwrap();
+    let mut connected = Vec::new();
+    for credentials in ["alice:one", "bob:two"] {
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+        client
+            .write_all(
+                format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_until(&mut client, b"ICY 200 OK").await;
+        assert!(String::from_utf8_lossy(&response).contains("ICY 200 OK"));
+        let port = client.local_addr().unwrap().port();
+        let session = wait_session(&proxy, |r| {
+            r["clientPort"] == port && r["active"] == true && r["authenticated"] == true
+        })
+        .await;
+        connected.push((client, session));
+    }
+    for credentials in [
+        "alice:two",
+        "unknown:one",
+        "disabled:three",
+        "legacy:old",
+        "",
+    ] {
+        let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+        let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+        client
+            .write_all(
+                format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(read_to_string(&mut client).await.contains("401"));
+    }
+    let mut disabled = config;
+    for user in &mut disabled.users {
+        user.active = false;
+    }
+    proxy.configs.send(disabled).unwrap();
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("alice:one");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_to_string(&mut client).await.contains("401"));
+    // Confirm the server processes new bytes on each original session after reload.
+    let sentence = b"$GPGSA,A,3\r\n";
+    for (client, original) in &mut connected {
+        client.write_all(sentence).await.unwrap();
+        let expected_bytes = original["bytesReceived"].as_u64().unwrap() + sentence.len() as u64;
+        let session = wait_session(&proxy, |r| {
+            r["id"] == original["id"]
+                && r["active"] == true
+                && r["bytesReceived"].as_u64().unwrap_or(0) >= expected_bytes
+        })
+        .await;
+        assert_eq!(session["authenticated"], true);
+        assert_eq!(session["bytesReceived"], expected_bytes);
+    }
+    proxy.stop();
+}
+
+// No second rover GGA is sent: both recovery paths must run independently.
+#[tokio::test]
+async fn dropped_caster_reconnects_immediately_without_another_gga() {
+    check_autonomous_reconnect(false).await;
+}
+
+#[tokio::test]
+async fn rejected_caster_retries_on_timer_without_another_gga() {
+    check_autonomous_reconnect(true).await;
+}
+
+async fn check_autonomous_reconnect(reject_first: bool) {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    let expected_gga = gga(37.0, -122.0);
+    let forwarded_gga = expected_gga.clone();
+    let task = tokio::spawn(async move {
+        let (mut first, _) = caster.accept().await.unwrap();
+        read_until(&mut first, b"\r\n\r\n").await;
+        if reject_first {
+            first
+                .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n")
+                .await
+                .unwrap();
+        } else {
+            first.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+            read_until(&mut first, b"\n").await;
+            first.write_all(b"FIRST").await.unwrap();
+        }
+        drop(first);
+        let started = tokio::time::Instant::now();
+        let limit = Duration::from_secs(if reject_first { 7 } else { 2 });
+        let (mut second, _) = timeout(limit, caster.accept())
+            .await
+            .expect("proxy did not reconnect without another GGA")
+            .unwrap();
+        if reject_first {
+            assert!(
+                started.elapsed() >= Duration::from_millis(4900),
+                "retry ignored backoff"
+            );
+        }
+        read_until(&mut second, b"\r\n\r\n").await;
+        second.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        let gga = read_until(&mut second, b"\n").await;
+        assert_eq!(
+            String::from_utf8(gga).unwrap(),
+            format!("{forwarded_gga}\r\n")
+        );
+        second.write_all(b"RECOVERED").await.unwrap();
+        let mut buf = [0; 1];
+        let _ = second.read(&mut buf).await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{expected_gga}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(8), async {
+        while !received.windows(9).any(|bytes| bytes == b"RECOVERED") {
+            let mut buf = [0; 128];
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "rover disconnected during recovery");
+            received.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("corrections did not resume");
+    drop(client);
+    task.await.unwrap();
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn stalled_timer_switch_keeps_forwarding_retained_corrections() {
+    let caster_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caster_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = caster_a.local_addr().unwrap().port();
+    let port_b = caster_b.local_addr().unwrap().port();
+    let (send_bytes, send) = tokio::sync::oneshot::channel();
+    let a = tokio::spawn(async move {
+        let (mut socket, _) = caster_a.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\n").await;
+        socket.write_all(b"FIRST").await.unwrap();
+        send.await.unwrap();
+        // The retained caster must receive the newer fix while B is stalled.
+        read_until(&mut socket, gga(37.95, -122.0).as_bytes()).await;
+        socket.write_all(b"STILL_STREAMING").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (retry_started, retry) = tokio::sync::oneshot::channel();
+    let (release_headers, headers) = tokio::sync::oneshot::channel();
+    let b = tokio::spawn(async move {
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        socket
+            .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n")
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, _) = caster_b.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        retry_started.send(()).unwrap();
+        headers.await.unwrap();
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        read_until(&mut socket, b"\n").await;
+        socket.write_all(b"REPLACED").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port_a, port_b).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.0, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"FIRST").await;
+    client
+        .write_all(format!("{}\r\n", gga(37.9, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    // Send no further rover GGA: wait for the autonomous switch retry.
+    timeout(Duration::from_secs(8), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .write_all(format!("{}\r\n", gga(37.95, -122.0)).as_bytes())
+        .await
+        .unwrap();
+    send_bytes.send(()).unwrap();
+    timeout(
+        Duration::from_secs(1),
+        read_until(&mut client, b"STILL_STREAMING"),
+    )
+    .await
+    .expect("stalled replacement blocked working caster");
+    let retained = wait_session(&proxy, |r| {
+        r["currentStation"] == "A" && r["status"] == "streaming"
+    })
+    .await;
+    assert_eq!(retained["active"], true);
+    release_headers.send(()).unwrap();
+    read_until(&mut client, b"REPLACED").await;
+    wait_session(&proxy, |r| r["currentStation"] == "B").await;
+    proxy.stop();
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
+async fn delayed_handshake_sends_latest_gga_without_a_third_fix() {
+    check_pending_gga_updates(false).await;
+}
+
+#[tokio::test]
+async fn batched_gga_sentences_coalesce_before_handshake_finishes() {
+    check_pending_gga_updates(true).await;
+}
+
+async fn check_pending_gga_updates(batched: bool) {
+    let caster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = caster.local_addr().unwrap().port();
+    let first = gga(37.0, -122.0);
+    let latest = gga(37.001, -122.0);
+    let expected = latest.clone();
+    let (requested, request_seen) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = caster.accept().await.unwrap();
+        read_until(&mut socket, b"\r\n\r\n").await;
+        requested.send(()).unwrap();
+        released.await.unwrap();
+        socket.write_all(b"ICY 200 OK\r\n\r\n").await.unwrap();
+        let sentence = read_until(&mut socket, b"\n").await;
+        assert_eq!(
+            String::from_utf8(sentence).unwrap(),
+            format!("{expected}\r\n")
+        );
+        socket.write_all(b"LATEST_FIX_RECEIVED").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let proxy = start_proxy(port, port).await;
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let token = base64::engine::general_purpose::STANDARD.encode("rover:secret");
+    client
+        .write_all(format!("GET /NEAR HTTP/1.0\r\nAuthorization: Basic {token}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_until(&mut client, b"\r\n\r\n").await;
+    if batched {
+        client
+            .write_all(format!("{first}\r\n{latest}\r\n").as_bytes())
+            .await
+            .unwrap();
+    } else {
+        client
+            .write_all(format!("{first}\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(2), request_seen)
+        .await
+        .unwrap()
+        .unwrap();
+    if !batched {
+        client
+            .write_all(format!("{latest}\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    // Confirm the second fix has been consumed before releasing the caster header.
+    wait_session(&proxy, |r| {
+        r["latitude"]
+            .as_f64()
+            .is_some_and(|lat| (lat - 37.001).abs() < 0.000001)
+    })
+    .await;
+    release.send(()).unwrap();
+    read_until(&mut client, b"LATEST_FIX_RECEIVED").await;
+    proxy.stop();
+    task.abort();
 }

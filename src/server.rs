@@ -30,6 +30,8 @@ struct Upstream {
     connected_at: Instant,
     session_id: String,
     bytes_received: u64,
+    gga_pending: Vec<u8>,
+    gga_latest: Option<Vec<u8>>,
 }
 
 // Kept inside the session so dropping the session cancels the dial as well.
@@ -465,30 +467,23 @@ async fn ensure_upstream(
     {
         *attempt = None;
     }
-    if current_mount.as_deref() == Some(mount.as_str()) {
-        if let Err(err) = forward_gga(upstream, gga).await {
-            registry.upstream(&live.id, "error", Some("caster GGA write failed"));
-            tracing::warn!(id = %live.id, mount = %mount, error = %err,
-                error_kind = ?err.kind(), os_error = ?err.raw_os_error(),
-                "caster GGA write failed; reconnecting immediately");
-            *last_fail = None;
-            *upstream = None;
-        }
+    // Every selected fix reaches the retained caster, including during dial/backoff.
+    if let Err(err) = forward_gga(upstream, gga).await {
+        tracing::warn!(id = %live.id, mount = ?current_mount, target_mount = %mount,
+            error = %err, "caster GGA write failed; reconnecting immediately");
+        registry.upstream(&live.id, "error", Some("caster GGA write failed"));
+        *last_fail = None;
+        *upstream = None;
         return;
     }
-    if let Some((failed, when)) = last_fail {
-        if failed == &mount && when.elapsed() < RETRY_AFTER {
-            if let Err(err) = forward_gga(upstream, gga).await {
-                tracing::warn!(id = %live.id,
-                    mount = current_mount.as_deref().unwrap_or("unknown"),
-                    target_mount = %mount, error = %err,
-                    "caster GGA write failed; reconnecting immediately");
-                *last_fail = None;
-                *upstream = None;
-                registry.upstream(&live.id, "error", Some("caster GGA write failed"));
-            }
-            return;
-        }
+    if current_mount.as_deref() == Some(mount.as_str()) {
+        return;
+    }
+    if last_fail
+        .as_ref()
+        .is_some_and(|(failed, when)| failed == &mount && when.elapsed() < RETRY_AFTER)
+    {
+        return;
     }
     if let Some(pending) = attempt.as_mut() {
         // Coalesce fixes while the handshake or a candidate GGA write is pending.
@@ -540,6 +535,8 @@ async fn ensure_upstream(
                     connected_at: Instant::now(),
                     session_id,
                     bytes_received: link.pending.len() as u64,
+                    gga_pending: Vec::new(),
+                    gga_latest: None,
                 },
                 link.pending,
             ))
@@ -554,14 +551,45 @@ async fn forward_gga(
     let Some(link) = upstream.as_mut() else {
         return Ok(());
     };
-    let line = format!("{}\r\n", gga.sentence);
-    link.write.write_all(line.as_bytes()).await
+    link.gga_latest = Some(format!("{}\r\n", gga.sentence).into_bytes());
+    flush_gga(link)
+}
+
+fn flush_gga(link: &mut Upstream) -> std::io::Result<()> {
+    loop {
+        if link.gga_pending.is_empty() {
+            let Some(next) = link.gga_latest.take() else {
+                return Ok(());
+            };
+            link.gga_pending = next;
+        }
+        match link.write.try_write(&link.gga_pending) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                link.gga_pending.drain(..n);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::io::Result<usize> {
     match upstream.as_mut() {
         Some(link) => {
-            match tokio::time::timeout_at(link.last_data + READ_IDLE, link.read.read(buf)).await {
+            let deadline = link.last_data + READ_IDLE;
+            let io = async {
+                loop {
+                    tokio::select! {
+                        n = link.read.read(buf) => return n,
+                        ready = link.write.writable(), if !link.gga_pending.is_empty() => {
+                            ready?;
+                            flush_gga(link)?;
+                        }
+                    }
+                }
+            };
+            match tokio::time::timeout_at(deadline, io).await {
                 Ok(result) => {
                     if matches!(result, Ok(n) if n > 0) {
                         if link.bytes_received == 0 {
@@ -630,6 +658,8 @@ mod tests {
             connected_at: Instant::now(),
             session_id: "test".into(),
             bytes_received: 0,
+            gga_pending: Vec::new(),
+            gga_latest: None,
         });
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await

@@ -803,6 +803,8 @@ async fn stalled_timer_switch_keeps_forwarding_retained_corrections() {
         read_until(&mut socket, b"\n").await;
         socket.write_all(b"FIRST").await.unwrap();
         send.await.unwrap();
+        // The retained caster must receive the newer fix while B is stalled.
+        read_until(&mut socket, gga(37.95, -122.0).as_bytes()).await;
         socket.write_all(b"STILL_STREAMING").await.unwrap();
         std::future::pending::<()>().await;
     });
@@ -846,6 +848,10 @@ async fn stalled_timer_switch_keeps_forwarding_retained_corrections() {
     timeout(Duration::from_secs(8), retry)
         .await
         .unwrap()
+        .unwrap();
+    client
+        .write_all(format!("{}\r\n", gga(37.95, -122.0)).as_bytes())
+        .await
         .unwrap();
     send_bytes.send(()).unwrap();
     timeout(

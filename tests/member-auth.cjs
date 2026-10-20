@@ -55,3 +55,53 @@ test('member actions stay serialized through password rotation and list refresh'
     assert.equal(elements.get('message').textContent, 'Rotation failed');
     assert.ok(buttons.every(button => !button.disabled), 'failed requests release the action lock');
 });
+
+function loginPage({ token = '', failure } = {}) {
+    const email = { value: 'invited@example.com' }, button = {}, message = {};
+    const form = { hidden: false, addEventListener(_event, handler) { this.submit = handler; } };
+    const requests = [], redirects = [], historyChanges = [];
+    const elements = { loginForm: form, email, message };
+    const context = vm.createContext({
+        document: { getElementById: id => elements[id], querySelectorAll: () => [button] },
+        location: { hash: token ? '#' + token : '', assign(url) { redirects.push(url); } },
+        history: { replaceState(...args) { historyChanges.push(args); } },
+        fetch: async (url, options) => {
+            requests.push({ url, body: JSON.parse(options.body) });
+            if (failure && url.endsWith('/verify')) return { ok: false, status: 401, json: async () => ({ error: failure }) };
+            return response({ message: 'Check your email' });
+        },
+    });
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/public/member-auth.js'), 'utf8'), context);
+    return { email, button, form, message, requests, redirects, historyChanges };
+}
+test('emailed magic link signs in automatically and removes its token from the address bar', async () => {
+    const page = loginPage({ token: 'a'.repeat(64) });
+    assert.equal(page.form.hidden, true);
+    assert.equal(page.historyChanges[0][2], '/login');
+    assert.equal(page.requests[0].url, '/api/member/verify');
+    assert.equal(page.requests[0].body.token, 'a'.repeat(64));
+    await new Promise(setImmediate);
+    assert.deepEqual(page.redirects, ['/']);
+    assert.equal(page.requests.length, 1, 'no second click or email request');
+});
+test('expired magic link shows a useful error and allows requesting a replacement', async () => {
+    const page = loginPage({ token: 'b'.repeat(64), failure: 'Invalid or expired sign-in link' });
+    await new Promise(setImmediate);
+    assert.equal(page.form.hidden, false);
+    assert.match(page.message.textContent, /Invalid or expired.*Request a new sign-in link/);
+    assert.deepEqual(page.redirects, []);
+    page.form.submit({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(page.requests[1].url, '/api/member/login');
+    assert.equal(page.requests[1].body.email, 'invited@example.com');
+    assert.equal(page.message.textContent, 'Check your email');
+});
+test('ordinary login asks for a link without revealing administration navigation', async () => {
+    const page = loginPage();
+    assert.equal(page.requests.length, 0);
+    page.form.submit({ preventDefault() {} });
+    await new Promise(setImmediate);
+    assert.equal(page.requests[0].url, '/api/member/login');
+    const html = fs.readFileSync(path.join(__dirname, '../web/public/login.html'), 'utf8');
+    assert.doesNotMatch(html, /href=["']\/admin/);
+});

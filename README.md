@@ -405,8 +405,8 @@ there is no public registration. Existing members must have an email added befor
 they can sign in. Dashboard password login is replaced by email links; admin
 HTTP Basic authentication and NTRIP credentials are unchanged.
 
-Members enter their email at `/login`, open the emailed link, and click **Confirm
-sign in**. Links expire after 15 minutes and can be used once. A one-minute
+Members enter their email at `/login` and open the emailed link to sign in
+automatically. Links expire after 15 minutes and can be used once. A one-minute
 per-member cooldown limits repeated sends while a link is pending. The response does not disclose
 whether an email is invited. Links and sessions reset when Node restarts;
 changing a member or disabling it revokes pending links and dashboard sessions.

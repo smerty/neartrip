@@ -20,6 +20,7 @@ test('mail defaults to TLS on 465 and builds links from PUBLIC_HOSTNAME', () => 
     assert.equal(mail.options().secure, true);
     assert.equal(mail.options().auth.pass, 'secret');
     assert.equal(mail.message().to, 'invited@example.com');
+    assert.match(mail.message().html, /href="https:\/\/rtk\.k6sh\.com\/login#token"/);
     assert.match(mail.message().text, /https:\/\/rtk\.k6sh\.com\/login#token/);
 });
 test('STARTTLS must be required when direct TLS is disabled', () => {

@@ -20,14 +20,28 @@
     }
     const login = document.getElementById('loginForm');
     if (login) {
+        login.addEventListener('submit', e => {
+            e.preventDefault();
+            run(async () => {
+                const result = await api('login', 'POST', { email: document.getElementById('email').value });
+                message.textContent = result.message;
+            });
+        });
         const token = location.hash.slice(1);
         if (token) {
             history.replaceState(null, '', '/login');
-            const button = login.querySelector('button');
-            login.querySelector('#email').required = false;
-            button.textContent = 'Confirm sign in';
-            login.addEventListener('submit', e => { e.preventDefault(); run(async () => { await api('verify', 'POST', { token }); location.assign('/'); }); });
-        } else login.addEventListener('submit', e => { e.preventDefault(); run(async () => { const result = await api('login', 'POST', { email: document.getElementById('email').value }); document.getElementById('message').textContent = result.message; }); });
+            login.hidden = true;
+            run(async () => {
+                message.textContent = 'Signing you in…';
+                try {
+                    await api('verify', 'POST', { token });
+                    location.assign('/');
+                } catch (error) {
+                    login.hidden = false;
+                    throw new Error(error.message + '. Request a new sign-in link below.');
+                }
+            });
+        }
         return;
     }
     const secret = data => { const el = document.getElementById('newCredentials'); el.hidden = false; el.textContent = 'Username: ' + data.username + '\nPassword: ' + data.password + '\nCopy now — this password will not be displayed again.'; el.focus(); };

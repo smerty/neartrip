@@ -14,7 +14,9 @@ function createMailer() {
     });
     return { send(email, token) {
         const url = new URL('/login', base); url.hash = token;
+        const href = url.href.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
         return transport.sendMail({ from: env.MAIL_FROM, to: email, subject: 'Sign in to NearTRIP',
+            html: `<p><a href="${href}">Sign in to NearTRIP</a></p><p>This link expires in 15 minutes and can be used once. If you did not request it, ignore this email.</p>`,
             text: `Sign in to NearTRIP:\n\n${url.href}\n\nThis link expires in 15 minutes and can be used once. If you did not request it, ignore this email.` });
     } };
 }

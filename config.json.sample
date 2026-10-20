@@ -26,5 +26,15 @@
             "longitude": -123.456
         }
     ],
-    "sources": []
+    "sources": [],
+    "security": {
+        "autoSoftBan": false,
+        "failureThreshold": 20,
+        "windowSeconds": 300,
+        "softBanSeconds": 600,
+        "allowlistedIps": [],
+        "permanentBans": [],
+        "temporaryBans": []
+    },
+    "members": []
 }

@@ -3,6 +3,7 @@
  * Provides a web interface for managing stations and viewing connections
  */
 const express = require('express');
+const { setupMembers } = require('../utils/members');
 const basicAuth = require('express-basic-auth');
 const cors = require('cors');
 const morgan = require('morgan');
@@ -11,6 +12,7 @@ const fs = require('fs');
 const logger = require('../utils/logger');
 const configManager = require('../utils/config');
 const { validateSources, publicSource, sourceHealth } = require('../utils/sources');
+const { setupManagement, validateManagement, publicStations } = require('../utils/management');
 
 // Store all connections (active and historical) for the admin interface
 const connections = new Map();
@@ -54,6 +56,14 @@ function initAdminServer(options = {}) {
     // Enable CORS
     app.use(cors());
 
+    const memberAccess = setupMembers(app, configManager, saveConfig, { username, password });
+    app.get(['/', '/rovers', '/api/public/stations', '/index.html', '/rovers.html'], memberAccess.guard);
+    app.get('/rovers', (_req, res) => res.sendFile(path.join(__dirname, '..', 'web/public/rovers.html')));
+    // Station metadata is available only to authenticated members or admins.
+    app.get('/api/public/stations', (_req, res) => {
+        res.json(publicStations(configManager.getConfig()));
+    });
+    app.use(express.static(path.join(__dirname, '..', 'web', 'public')));
     // Basic authentication
     app.use(basicAuth({
         users: { [username]: password },
@@ -61,13 +71,17 @@ function initAdminServer(options = {}) {
         realm: 'NearTRIP Admin'
     }));
 
+    app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
+
     // Serve static files from the admin/public directory
     const publicPath = path.join(__dirname, 'public');
     if (!fs.existsSync(publicPath)) {
         fs.mkdirSync(publicPath, { recursive: true });
     }
-    app.use(express.static(publicPath));
+    app.get('/admin', (_req, res) => res.sendFile(path.join(publicPath, 'index.html')));
+    app.use(express.static(publicPath, { index: false }));
 
+    memberAccess.setupAdmin();
     // API endpoints
     setupApiRoutes(app);    // Start server
     const server = app.listen(port, () => {
@@ -90,6 +104,7 @@ function initAdminServer(options = {}) {
  * @param {express.Application} app - Express app
  */
 function setupApiRoutes(app) {
+    setupManagement(app, configManager, saveConfig);
     app.get('/api/sources', (req, res) => {
         res.json(sourceHealth(configManager.getConfig()));
     });
@@ -291,7 +306,7 @@ function setupApiRoutes(app) {
     app.get('/api/info', (req, res) => {
         try {
             const config = configManager.getConfig();
-            const { username, password, users, adminPassword, sources, ...safeConfig } = config;
+            const { username, password, users, adminPassword, members, sources, ...safeConfig } = config;
             safeConfig.sources = (sources || []).map(publicSource);
             res.json({
                 version: require('../package.json').version,
@@ -327,6 +342,8 @@ function setupApiRoutes(app) {
                 return res.status(400).json({ error: 'Invalid configuration format' });
             }
             
+            const managementError = validateManagement(newConfig);
+            if (managementError) return res.status(400).json({ error: managementError });
             const sourceError = validateSources(newConfig);
             if (sourceError) return res.status(400).json({ error: sourceError });
             // Save the new config
@@ -429,7 +446,7 @@ function connectionLogPath(id, connection) {
 function saveConfig(config) {
     // Docker links config.json into its persistent configuration volume.
     const configPath = fs.realpathSync(configManager.CONFIG_FILE_PATH);
-    const error = validateSources(config);
+    const error = validateSources(config) || validateManagement(config);
     if (error) throw new Error(error);
     const mode = fs.statSync(configPath).mode & 0o777;
     // A private, unique directory also avoids following a leftover temp symlink.

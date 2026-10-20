@@ -39,6 +39,8 @@ struct SessionRecord {
     nmea_log_file: String,
     status: String,
     authenticated: bool,
+    role: String,
+    username: Option<String>,
     upstream_status: String,
     last_upstream_error: Option<String>,
     last_gga_at: Option<String>,
@@ -53,6 +55,8 @@ pub struct Registry {
     inner: Mutex<SessionTable>,
     flush_lock: Mutex<()>,
     changed: Notify,
+    pub security: crate::security::Security,
+    stats: crate::stats::Stats,
 }
 
 #[derive(Default)]
@@ -142,6 +146,8 @@ impl Registry {
             inner: Mutex::new(table),
             flush_lock: Mutex::new(()),
             changed: Notify::new(),
+            security: crate::security::Security::default(),
+            stats: crate::stats::Stats::default(),
         }
     }
 
@@ -231,12 +237,28 @@ impl Registry {
     }
 
     pub fn publisher(&self, id: &str) {
-        self.with_mut(|sessions| {
-            if let Some(session) = sessions.get_mut(id) {
-                session.status = "publishing".into();
-                session.read_idle_timeout_secs = 30;
+        let identity = self.with_mut(|sessions| {
+            let session = sessions.get_mut(id)?;
+            if session.role == "publisher" {
+                return None;
             }
+            session.role = "publisher".into();
+            session.status = "publishing".into();
+            session.read_idle_timeout_secs = 30;
+            Some((session.client_ip.clone(), session.current_station.clone()?))
         });
+        if let Some((ip, mount)) = identity {
+            let now = crate::caster::now_ms();
+            self.stats.start(id, mount, true, now);
+            if let Ok(ip) = ip.parse() {
+                self.security.authenticated(ip, now);
+            }
+        }
+    }
+
+    pub fn publisher_bytes(&self, id: &str, bytes: usize) {
+        self.stats
+            .bytes(id, 0, bytes as u64, true, crate::caster::now_ms());
     }
 
     pub fn position(&self, id: &str, lat: f64, lon: f64, fix_quality: u32, satellites: u32) {
@@ -261,6 +283,8 @@ impl Registry {
     }
 
     pub fn add_bytes(&self, id: &str, sent: u64, received: u64) {
+        self.stats
+            .bytes(id, sent, received, false, crate::caster::now_ms());
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
                 if sent > 0 {
@@ -277,13 +301,64 @@ impl Registry {
     }
 
     pub fn authenticated(&self, id: &str) {
-        self.with_mut(|sessions| {
-            if let Some(session) = sessions.get_mut(id) {
-                session.authenticated = true;
-                session.status = "awaiting_gga".into();
+        self.authenticated_as(id, None);
+    }
+
+    pub fn rover_revoked(&self, id: &str, config: &crate::config::Config) -> bool {
+        let state = self.inner.lock().expect("registry lock");
+        let Some(session) = state
+            .by_id
+            .get(id)
+            .and_then(|index| state.records.get(*index))
+        else {
+            return false;
+        };
+        if session.role != "rover" {
+            return false;
+        }
+        match session.username.as_ref() {
+            Some(name) => {
+                !(config
+                    .users
+                    .iter()
+                    .any(|u| &u.username == name && config.user_enabled(u))
+                    || (config.users.is_empty()
+                        && config.members.is_empty()
+                        && &config.username == name))
             }
+            None => config.requires_auth(),
+        }
+    }
+
+    pub fn authenticated_as(&self, id: &str, username: Option<&str>) {
+        let identity = self.with_mut(|sessions| {
+            let session = sessions.get_mut(id)?;
+            if session.authenticated {
+                return None;
+            }
+            session.authenticated = true;
+            session.role = "rover".into();
+            session.username = username.map(str::to_string);
+            session.status = "awaiting_gga".into();
+            Some(session.client_ip.clone())
         });
+        if let Some(ip) = identity {
+            let now = crate::caster::now_ms();
+            let key = username
+                .map(|u| format!("login:{u}"))
+                .unwrap_or_else(|| format!("ip:{ip}"));
+            self.stats.start(id, key, false, now);
+            if let Ok(ip) = ip.parse() {
+                self.security.authenticated(ip, now);
+            }
+        }
         self.changed.notify_one();
+    }
+
+    pub fn operations(&self, config: &crate::Config) -> serde_json::Value {
+        let now = crate::caster::now_ms();
+        serde_json::json!({ "updatedAt": now, "stats": self.stats.snapshot(now),
+            "security": self.security.snapshot(&config.security, now) })
     }
 
     pub fn upstream(&self, id: &str, status: &str, error: Option<&str>) {
@@ -311,8 +386,14 @@ impl Registry {
 
     pub fn close_with_reason(&self, id: &str, reason: &str) {
         let (stamp, unix) = now_unix();
+        self.stats.close(id, crate::caster::now_ms());
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
+                if session.active && (session.authenticated || session.role == "publisher") {
+                    if let Ok(ip) = session.client_ip.parse() {
+                        self.security.closed(ip);
+                    }
+                }
                 session.active = false;
                 session.status = "disconnected".into();
                 session.upstream_status = "disconnected".into();

@@ -74,6 +74,8 @@ function apiFixture(realConfigPath, realFs = fs) {
                 getConfig() { return config; }, CONFIG_FILE_PATH: realConfigPath || '/tmp/neartrip-test-config.json',
                 reloadConfig() { config = realConfigPath ? JSON.parse(fs.readFileSync(realConfigPath, 'utf8')) : saved; },
             };
+            if (name === '../utils/members') return { setupMembers() { return { guard(_req, _res, next) { next(); }, setupAdmin() {} }; } };
+            if (name === '../utils/management') return require('../utils/management');
             if (name === '../utils/sources') return { validateSources, publicSource, sourceHealth: cfg => cfg.sources.map(publicSource) };
             if (name === '../package.json') return { version: 'test' };
             throw new Error('Unexpected dependency: ' + name);

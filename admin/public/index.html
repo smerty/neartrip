@@ -78,6 +78,8 @@
             background-color: #2196F3;
         }
     </style>
+    <link rel="stylesheet" href="/network.css">
+    <link rel="stylesheet" href="/console.css">
 </head>
 <body>
     <div class="container">
@@ -97,6 +99,10 @@
                         <li class="nav-item">
                             <a class="nav-link" href="#map">Map</a>
                         </li>
+                        <li class="nav-item"><a class="nav-link" href="#users">Users</a></li>
+                        <li class="nav-item"><a class="nav-link" href="#statistics">Statistics</a></li>
+                        <li class="nav-item"><a class="nav-link" href="#security">IP policy</a></li>
+                        <li class="nav-item"><a class="nav-link" href="/">Member map ↗</a></li>
                         <li class="nav-item">
                             <a class="nav-link" href="#settings">Settings</a>
                         </li>
@@ -197,23 +203,66 @@
         </div>
 
         <div id="map" class="mb-4" style="display: none;">
-            <h2>Map View</h2>
-            <div class="map-legend mb-3">
-                <div class="legend-item">
-                    <span class="legend-marker marker-station-active"></span>
-                    <span>Active Station</span>
-                </div>
-                <div class="legend-item">
-                    <span class="legend-marker marker-station-inactive"></span>
-                    <span>Inactive Station</span>
-                </div>
-                <div class="legend-item">
-                    <span class="legend-marker marker-client"></span>
-                    <span>Client Connection</span>
-                </div>
-            </div>
-            <div id="mapContainer"></div>
-        </div>        <div id="settings" class="mb-4" style="display: none;">
+            <div class="d-flex justify-content-between align-items-center mb-3"><div><p class="console-eyebrow">Network operations</p><h2>Live network atlas</h2></div><button class="btn btn-outline-secondary" id="fitAdminNetwork">Fit stations</button></div>
+            <p class="text-muted">Direct and relayed bases, live rover positions, and links to each rover's selected base. These client details are private to the admin console.</p>
+            <div id="mapContainer" class="network-map console-map"></div>
+        </div>
+        <section id="users" class="mb-4" style="display:none">
+            <p class="console-eyebrow">Access management</p><h2>Members</h2>
+            <p>Create dashboard accounts here. Members manage their own rover credentials. Disabling a member signs them out and disconnects their rovers within approximately one second.</p>
+            <p id="memberMessage" role="status"></p><div id="memberList"></div>
+            <form id="memberForm" class="console-card"><h3 id="memberTitle">Create member</h3><div class="row g-3">
+            <div class="col-md-4"><label for="memberName">Username</label><input id="memberName" class="form-control" required maxlength="64" autocomplete="off"></div>
+            <div class="col-md-4"><label for="memberPassword">Dashboard password</label><input id="memberPassword" class="form-control" type="password" minlength="12" maxlength="256" autocomplete="new-password"><small>Minimum 12 characters. Leave blank when editing to keep it.</small></div>
+            <div class="col-md-4"><label><input id="memberActive" type="checkbox" checked> Enabled</label></div></div>
+            <button class="btn btn-primary mt-3">Save member</button><button id="memberCancel" type="button" class="btn btn-secondary mt-3">New member</button></form>
+            <h2 class="mt-4">Rover users</h2>
+            <p>Manage NTRIP client logins. Publisher accounts stay under Direct Base Stations; the web admin login remains separate.</p>
+            <div id="userMode" class="alert alert-info"></div>
+            <p class="text-muted">Disabled accounts are disconnected within approximately one second. Disable the last account to close access without restoring shared or anonymous access.</p>
+            <p id="userMessage" role="status" aria-live="polite"></p>
+            <button class="btn btn-primary mb-3" id="addUserBtn">Add rover user</button>
+            <div class="table-responsive"><table class="table" id="usersTable"><thead><tr><th>Username</th><th>Status</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+            <form id="userForm" class="console-card" hidden>
+                <h3 id="userFormTitle">Add rover user</h3><div class="row g-3">
+                <div class="col-md-4"><label for="userName" class="form-label">Username</label><input id="userName" class="form-control" required maxlength="64" pattern="[A-Za-z0-9_.@-]+"></div>
+                <div class="col-md-4"><label for="userPassword" class="form-label">Password</label><input id="userPassword" class="form-control" type="password" autocomplete="new-password"><small class="text-muted">Leave blank when editing to keep the current password.</small></div>
+                <div class="col-md-4"><label class="form-label"><input id="userActive" type="checkbox" checked> Enabled</label></div></div>
+                <button type="submit" class="btn btn-primary mt-3">Save user</button><button type="button" class="btn btn-secondary mt-3" id="cancelUserBtn">Cancel</button>
+            </form>
+        </section>
+        <section id="statistics" class="mb-4" style="display:none">
+            <p class="console-eyebrow">Traffic &amp; connections</p><h2>Network statistics</h2><p id="statsSince" class="text-muted">Loading live statistics…</p>
+            <p id="statsMessage" role="status" aria-live="polite"></p>
+            <div id="statsCards" class="console-metrics"></div>
+            <h3 class="mt-4">Direct base stations</h3><div class="table-responsive"><table id="baseStats" class="table"><thead><tr><th>Mountpoint</th><th>Uploads</th><th>Active uploads</th><th>Correction data received</th><th>Connected time</th><th>Last seen</th></tr></thead><tbody></tbody></table></div>
+            <h3 class="mt-4">Clients by login or IP</h3><div class="table-responsive"><table id="clientStats" class="table"><thead><tr><th>Identity</th><th>Sessions</th><th>Active</th><th>Corrections delivered</th><th>Input received</th><th>Connected time</th><th>Last seen</th></tr></thead><tbody></tbody></table></div>
+            <p class="text-muted">Counters live in core memory and reset when the core restarts. Anonymous clients are grouped by their TCP peer IP. A bounded set of 10,000 inactive identities is retained per group.</p>
+        </section>
+        <section id="security" class="mb-4" style="display:none">
+            <p class="console-eyebrow">Measured protection</p><h2>NTRIP IP activity &amp; bans</h2>
+            <p>Review repeated login failures and malformed requests before taking action. Normal disconnects, missing GGA, and stale correction streams never trigger automatic bans.</p>
+            <p id="securityMessage" role="status" aria-live="polite"></p>
+            <form id="policyForm" class="console-card">
+                <h3>Automatic softbans <span class="badge bg-secondary">Opt-in</span></h3>
+                <label class="form-check-label mb-3"><input id="autoSoftBan" type="checkbox"> Enable temporary bans for repeated authentication failures</label>
+                <div class="row g-3"><div class="col-md-4"><label class="form-label" for="failureThreshold">Failed logins</label><input id="failureThreshold" type="number" min="10" max="1000" value="20" required class="form-control"></div>
+                <div class="col-md-4"><label class="form-label" for="windowSeconds">Within seconds</label><input id="windowSeconds" type="number" min="60" max="3600" value="300" required class="form-control"></div>
+                <div class="col-md-4"><label class="form-label" for="softBanSeconds">Ban duration (seconds)</label><input id="softBanSeconds" type="number" min="60" max="86400" value="600" required class="form-control"></div>
+                <div class="col-12"><label class="form-label" for="allowlistedIps">Auto-ban exemptions (one IP per line)</label><textarea id="allowlistedIps" class="form-control" rows="2"></textarea></div></div>
+                <p class="text-muted mt-3">Active authenticated connections, IPs with a successful login in the last 30 minutes, loopback, and exemptions are protected from automatic bans. Manual bans still take priority. Addresses are the listener's TCP peers; a proxy or shared NAT may represent multiple clients.</p>
+                <button type="submit" class="btn btn-primary">Save IP policy</button>
+            </form>
+            <form id="banForm" class="console-card mt-3"><h3>Manual action</h3><div class="row g-3">
+                <div class="col-md-4"><label class="form-label" for="banIp">IP address</label><input id="banIp" class="form-control" required placeholder="IPv4 or IPv6"></div>
+                <div class="col-md-3"><label class="form-label" for="banKind">Action</label><select id="banKind" class="form-select"><option value="temporary">Temporary ban</option><option value="permanent">Permanent ban</option><option value="unban">Remove manual ban</option><option value="exempt">Exempt from automatic bans</option></select></div>
+                <div class="col-md-5"><label class="form-label" for="banReason">Reason</label><input id="banReason" class="form-control" maxlength="200" placeholder="Optional review note"></div></div>
+                <button type="submit" class="btn btn-outline-danger mt-3">Apply action</button><small class="text-muted ms-3">Bans affect new and existing NTRIP connections; the admin website remains accessible.</small>
+            </form>
+            <label class="mt-4 mb-2"><input type="checkbox" id="showAllIps"> Show all observed IPs, including successful clients</label>
+            <p id="securityFreshness" class="text-muted"></p><div class="table-responsive"><table id="ipTable" class="table"><thead><tr><th>IP</th><th>Connections</th><th>Auth failures</th><th>Malformed</th><th>Blocked</th><th>Successful / active</th><th>Policy</th><th>Last seen</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+        </section>
+        <div id="settings" class="mb-4" style="display: none;">
             <h2>Server Settings</h2>
             <div class="row mb-3">
                 <div class="col-md-6">
@@ -311,7 +360,9 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" 
             integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" 
             crossorigin=""></script>
-    <script src="admin.js"></script>
-    <script src="sources.js"></script>
+    <script src="/network-map.js"></script>
+    <script src="/admin.js"></script>
+    <script src="/sources.js"></script>
+    <script src="/management.js"></script><script src="/members.js"></script>
 </body>
 </html>

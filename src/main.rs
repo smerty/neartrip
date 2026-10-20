@@ -88,8 +88,56 @@ async fn main() {
         config_rx.clone(),
         shutdown_rx.clone(),
     ));
+    let operations_path = env::var("NEARTRIP_OPERATIONS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("logs/operations.json"));
+    let op_registry = registry.clone();
+    let op_config = config_rx.clone();
+    let mut op_shutdown = shutdown_rx.clone();
+    let operations_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! { _ = interval.tick() => {}, _ = op_shutdown.changed() => break }
+            let data = op_registry.operations(&op_config.borrow());
+            let path = operations_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temp)?;
+                use std::io::Write;
+                let result = file
+                    .write_all(data.to_string().as_bytes())
+                    .and_then(|_| std::fs::rename(&temp, &path));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(temp);
+                }
+                result
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "operations snapshot failed"),
+                Err(error) => tracing::warn!(%error, "operations snapshot task failed"),
+            }
+        }
+        let _ = tokio::fs::remove_file(operations_path).await;
+    });
     serve_with_hub(listener, config_rx, registry.clone(), shutdown_rx, hub).await;
     let _ = health_task.await;
+    let _ = operations_task.await;
     registry.flush();
 }
 

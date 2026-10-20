@@ -91,16 +91,37 @@ pub async fn serve_with_hub(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((socket, peer)) => {
+                    Ok((mut socket, peer)) => {
+                        if !registry.security.admit(peer.ip(), &configs.borrow().security, crate::caster::now_ms()) {
+                            clients.spawn(async move {
+                                let _ = tokio::time::timeout(Duration::from_secs(1),
+                                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")).await;
+                            });
+                            continue;
+                        }
                         let hub = hub.clone();
                         let configs = configs.clone();
                         let registry = Arc::clone(&registry);
                         let mut shutdown = shutdown.clone();
                         clients.spawn(async move {
                             let live = registry.open(peer).await;
-                            let reason = tokio::select! {
-                                _ = shutdown.changed() => "core shutdown".to_string(),
-                                reason = handle_client(socket, peer, configs, &registry, &live, &hub) => reason,
+                            let policy_configs = configs.clone();
+                            let session = handle_client(socket, peer, configs, &registry, &live, &hub);
+                            tokio::pin!(session);
+                            let mut policy_tick = tokio::time::interval(Duration::from_secs(1));
+                            let reason = loop {
+                                tokio::select! {
+                                    _ = shutdown.changed() => break "core shutdown".to_string(),
+                                    _ = policy_tick.tick() => {
+                                        if registry.rover_revoked(&live.id, &policy_configs.borrow()) {
+                                            break "rover access revoked".to_string();
+                                        }
+                                        if registry.security.blocked(peer.ip(), &policy_configs.borrow().security, crate::caster::now_ms()) {
+                                            break "IP banned".to_string();
+                                        }
+                                    }
+                                    reason = &mut session => break reason,
+                                }
                             };
                             registry.close_with_reason(&live.id, &reason);
                         });
@@ -127,10 +148,28 @@ async fn handle_client(
     let _ = socket.set_nodelay(true);
     let id = &live.id;
     tracing::info!(%id, %peer, "client connected");
-    let reason = session(socket, configs, registry, live, hub)
+    let reason = session(socket, configs.clone(), registry, live, hub)
         .await
         .err()
         .unwrap_or_else(|| "sourcetable served".into());
+    if reason == "401 Unauthorized" || reason.starts_with("HTTP/1.1 401 ") {
+        registry.security.failure(
+            peer.ip(),
+            true,
+            &configs.borrow().security,
+            crate::caster::now_ms(),
+        );
+    } else if reason == "400 Bad Request"
+        || reason.starts_with("HTTP/1.1 400 ")
+        || reason == "handshake too large"
+    {
+        registry.security.failure(
+            peer.ip(),
+            false,
+            &configs.borrow().security,
+            crate::caster::now_ms(),
+        );
+    }
     tracing::info!(%id, %peer, %reason, "client disconnected");
     reason
 }
@@ -181,8 +220,8 @@ async fn session(
                     let _ = client_write.shutdown().await;
                     return Err(body);
                 }
-                RequestAction::Stream => {
-                    registry.authenticated(&live.id);
+                RequestAction::Stream(username) => {
+                    registry.authenticated_as(&live.id, username.as_deref());
                     client_write
                         .write_all(b"ICY 200 OK\r\n\r\n")
                         .await
@@ -209,7 +248,7 @@ async fn session(
 enum RequestAction {
     Sourcetable,
     Reject(String),
-    Stream,
+    Stream(Option<String>),
 }
 
 fn dispatch_request(head: &str, configs: &watch::Receiver<Config>) -> RequestAction {
@@ -227,7 +266,11 @@ fn dispatch_request(head: &str, configs: &watch::Receiver<Config>) -> RequestAct
     if config.requires_auth() && !auth_matches(&config, request.auth.as_ref()) {
         return RequestAction::Reject("HTTP/1.1 401 Unauthorized\r\n\r\n".into());
     }
-    RequestAction::Stream
+    RequestAction::Stream(if config.requires_auth() {
+        request.auth.map(|a| a.0)
+    } else {
+        None
+    })
 }
 
 struct ClientRequest {
@@ -272,11 +315,11 @@ pub(crate) fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> 
     let Some((user, pass)) = auth else {
         return false;
     };
-    if !config.users.is_empty() {
+    if !config.users.is_empty() || !config.members.is_empty() {
         return config.users.iter().fold(false, |matched, account| {
             let credentials_match = ct_eq(user.as_bytes(), account.username.as_bytes())
                 & ct_eq(pass.as_bytes(), account.password.as_bytes());
-            matched | (account.active & credentials_match)
+            matched | (config.user_enabled(account) & credentials_match)
         });
     }
     ct_eq(user.as_bytes(), config.username.as_bytes())

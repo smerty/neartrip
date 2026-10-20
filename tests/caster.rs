@@ -594,3 +594,143 @@ async fn length_framed_post_stops_at_body_boundary_and_releases_mountpoint() {
     task.await.unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn runtime_stats_attribute_logins_and_ip_clients_and_manual_bans_close_live_connections() {
+    let config = Config::parse(
+        r#"{"users":[{"username":"alpha","password":"one"}],
+        "sources":[{"mountPoint":"BASE","username":"base","password":"pw"}]}"#,
+    )
+    .unwrap();
+    let (cfg, configs) = watch::channel(config.clone());
+    let (stop, shutdown) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = std::env::temp_dir().join(format!("neartrip-operations-{}", std::process::id()));
+    let registry = Arc::new(Registry::new(dir.join("sessions.json")));
+    let task = tokio::spawn(serve(listener, configs, registry.clone(), shutdown));
+    let (mut source, _) = request(addr, "SOURCE pw /BASE\r\n\r\nABC").await;
+    let (mut a, _) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YWxwaGE6b25l\r\n\r\n",
+    )
+    .await;
+    let (mut b, _) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YWxwaGE6b25l\r\n\r\n",
+    )
+    .await;
+    let mut anonymous = config.clone();
+    anonymous.users.clear();
+    source.write_all(b"DATA").await.unwrap();
+    for rover in [&mut a, &mut b] {
+        payload(rover, b"DATA", 2).await;
+    }
+    let ops = registry.operations(&anonymous);
+    assert_eq!(
+        ops["stats"]["bases"][0]["bytesReceived"], 7,
+        "includes payload received with headers"
+    );
+    let clients = ops["stats"]["clients"].as_array().unwrap();
+    let login = clients.iter().find(|s| s["key"] == "login:alpha").unwrap();
+    assert_eq!(login["sessions"], 2);
+    assert_eq!(login["active"], 2);
+    assert_eq!(login["bytesSent"], 8);
+    cfg.send(anonymous.clone()).unwrap();
+    let (mut c, _) = request(addr, "GET /BASE HTTP/1.0\r\n\r\n").await;
+    source.write_all(b"NEXT").await.unwrap();
+    payload(&mut c, b"NEXT", 2).await;
+    let ops = registry.operations(&anonymous);
+    let ip = ops["stats"]["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "ip:127.0.0.1")
+        .unwrap();
+    assert_eq!(ip["bytesSent"], 4);
+    let mut banned = anonymous.clone();
+    banned
+        .security
+        .permanent_bans
+        .push(neartrip::security::Ban {
+            ip: "127.0.0.1".parse().unwrap(),
+            reason: "test".into(),
+        });
+    cfg.send(banned.clone()).unwrap();
+    for rover in [&mut a, &mut b, &mut c] {
+        let mut tail = Vec::new();
+        timeout(Duration::from_secs(3), rover.read_to_end(&mut tail))
+            .await
+            .unwrap()
+            .unwrap();
+        // Revoked logins may have received the last bytes before their policy tick.
+    }
+    let (_, response) = request(addr, "GET / HTTP/1.0\r\n\r\n").await;
+    assert!(response.contains("403"));
+    let ops = registry.operations(&banned);
+    assert_eq!(ops["stats"]["bases"][0]["active"], 0);
+    assert!(ops["security"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["blockedConnections"].as_u64().unwrap_or(0) > 0));
+    cfg.send(anonymous).unwrap();
+    let (_, response) = request(addr, "GET / HTTP/1.0\r\n\r\n").await;
+    assert!(response.contains("200"));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn disabling_member_revokes_live_rovers_but_preserves_publisher_and_other_members() {
+    let config = Config::parse(r#"{"members":[{"username":"alice","active":true},{"username":"bob","active":true}],"users":[{"username":"a","password":"pw","owner":"alice"},{"username":"b","password":"pw","owner":"bob"}],"sources":[{"mountPoint":"BASE","username":"base","password":"pw"}]}"#).unwrap();
+    let (cfg, configs) = watch::channel(config.clone());
+    let (stop, shutdown) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = std::env::temp_dir().join(format!("neartrip-members-{}", std::process::id()));
+    let registry = Arc::new(Registry::new(dir.join("sessions.json")));
+    let task = tokio::spawn(serve(listener, configs, registry, shutdown));
+    let (mut source, _) = request(addr, "SOURCE pw /BASE\r\n\r\n").await;
+    let (mut alice, response) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YTpwdw==\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("200"));
+    let (mut bob, _) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic Yjpwdw==\r\n\r\n",
+    )
+    .await;
+    source.write_all(b"ONE").await.unwrap();
+    payload(&mut alice, b"ONE", 2).await;
+    payload(&mut bob, b"ONE", 2).await;
+    let mut disabled = config.clone();
+    disabled.members[0].active = false;
+    cfg.send(disabled.clone()).unwrap();
+    let mut tail = Vec::new();
+    timeout(Duration::from_secs(3), alice.read_to_end(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, response) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YTpwdw==\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("401"));
+    source.write_all(b"TWO").await.unwrap();
+    payload(&mut bob, b"TWO", 2).await;
+    disabled.users.clear();
+    cfg.send(disabled).unwrap();
+    let (_, response) = request(addr, "GET /BASE HTTP/1.0\r\n\r\n").await;
+    assert!(
+        response.contains("401"),
+        "member network must not fall back to anonymous"
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

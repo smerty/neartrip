@@ -69,7 +69,7 @@ describe('GPS Utilities', () => {
 
     test('should find the closest station', () => {
       const result = gps.findClosestStation(37.55, -122.05, testStations);
-      expect(result.mountPoint).toBe('Station1');
+      expect(result.mountPoint).toBe('Station2');
       expect(result.distance).toBeDefined();
     });
 

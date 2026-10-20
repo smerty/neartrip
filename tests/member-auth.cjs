@@ -16,14 +16,17 @@ test('member actions stay serialized through password rotation and list refresh'
     for (const id of ['message', 'newCredentials', 'rovers', 'connectionInfo', 'createRover', 'logout']) elements.set(id, make(['createRover', 'logout'].includes(id) ? 'button' : 'div'));
     const rotation = deferred(), refresh = deferred();
     const requests = [];
-    let lists = 0, failNext = false;
+    let lists = 0, failNext = false, allowDelete = false, deleted = false;
     const list = { port: 2101, mountPoint: 'NEAR', users: [{ username: 'rover-one', active: true }] };
     const context = vm.createContext({
         document: { getElementById: id => elements.get(id), querySelectorAll: () => buttons, createElement: make },
         location: { hostname: 'localhost', assign() {} },
+        window: { confirm: () => allowDelete },
         fetch: async (url, options) => {
             requests.push({ url, options });
             if (url.endsWith('/me')) return response({ csrf: 'token' });
+            if (options.method === 'DELETE') { deleted = true; return response({ deleted: true }); }
+            if (deleted) return response({ ...list, users: [] });
             if (options.method === 'PUT') {
                 if (failNext) return { ok: false, status: 500, json: async () => ({ error: 'Rotation failed' }) };
                 return rotation.promise;
@@ -54,6 +57,17 @@ test('member actions stay serialized through password rotation and list refresh'
     await buttons.filter(button => button.textContent === 'Rotate password').at(-1).onclick();
     assert.equal(elements.get('message').textContent, 'Rotation failed');
     assert.ok(buttons.every(button => !button.disabled), 'failed requests release the action lock');
+    const remove = buttons.filter(button => button.textContent === 'Delete').at(-1);
+    await remove.onclick();
+    assert.equal(requests.filter(req => req.options.method === 'DELETE').length, 0, 'cancel leaves credentials intact');
+    allowDelete = true;
+    await remove.onclick();
+    const removal = requests.find(req => req.options.method === 'DELETE');
+    assert.equal(removal.url, '/api/member/rovers/rover-one');
+    assert.equal(removal.options.headers['X-CSRF-Token'], 'token');
+    assert.equal(elements.get('rovers').children.length, 0, 'deleted row is removed');
+    assert.equal(elements.get('newCredentials').hidden, true, 'deleted credentials are no longer displayed');
+    assert.equal(elements.get('newCredentials').textContent, '');
 });
 
 function loginPage({ token = '', failure } = {}) {

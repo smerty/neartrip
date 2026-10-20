@@ -345,14 +345,15 @@ impl Registry {
             session.username = username.map(str::to_string);
             session.credential = auth.map(|a| a.1.clone());
             session.status = "awaiting_gga".into();
-            Some(session.client_ip.clone())
+            Some((session.client_ip.clone(), session.bytes_received))
         });
-        if let Some(ip) = identity {
+        if let Some((ip, received)) = identity {
             let now = crate::caster::now_ms();
             let key = username
                 .map(|u| format!("login:{u}"))
                 .unwrap_or_else(|| format!("ip:{ip}"));
             self.stats.start(id, key, false, now);
+            self.stats.bytes(id, 0, received, false, now);
             if let Ok(ip) = ip.parse() {
                 self.security.authenticated(ip, now);
             }
@@ -812,5 +813,23 @@ mod tests {
         );
         assert!(snapshot.contains("203.0.113.10"), "{snapshot}");
         let _ = fs::remove_file(&path);
+    }
+    #[tokio::test]
+    async fn authenticated_stats_include_handshake_input_once_and_later_input() {
+        let registry = Registry::new(std::env::temp_dir().join("neartrip-handshake-stats.json"));
+        let live = registry.open("127.0.0.1:5000".parse().unwrap()).await;
+        let config = crate::Config::parse("{}").unwrap();
+        // Headers and coalesced GGA arrive before authentication starts stats.
+        registry.add_bytes(&live.id, 0, 180);
+        let auth = ("rover".to_string(), "secret".to_string());
+        registry.authenticated_as(&live.id, Some(&auth));
+        registry.authenticated_as(&live.id, Some(&auth));
+        registry.add_bytes(&live.id, 20, 75);
+        let snapshot = registry.operations(&config);
+        let counter = &snapshot["stats"]["clients"][0];
+        assert_eq!(counter["bytesReceived"], 255);
+        assert_eq!(counter["bytesSent"], 20);
+        assert_eq!(counter["sessions"], 1);
+        registry.close(&live.id);
     }
 }

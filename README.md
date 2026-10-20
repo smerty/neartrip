@@ -343,7 +343,8 @@ verified login, or peer IP for anonymous clients. Session counts, bytes, and
 connection time are process-local and reset when the Rust core restarts. Each
 category retains up to 10,000 identities, evicting inactive identities when full.
 The core writes a private, atomic `logs/operations.json` snapshot every second
-(`NEARTRIP_OPERATIONS` overrides it); the admin API rejects snapshots older than
+(`NEARTRIP_OPERATIONS` overrides it for both Node and the core; relative paths
+resolve from the Node launch directory); the admin API rejects snapshots older than
 five seconds. These snapshots are never restored into memory.
 
 Automatic soft bans are **off by default**. When enabled, the defaults require

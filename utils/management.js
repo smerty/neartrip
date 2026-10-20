@@ -1,7 +1,7 @@
 const fs = require('fs');
 const { validateMembers } = require('./members');
-const path = require('path');
 const net = require('net');
+const { OPERATIONS_PATH } = require('./paths');
 const { sourceHealth } = require('./sources');
 
 const policyDefaults = { autoSoftBan: false, failureThreshold: 20, windowSeconds: 300, softBanSeconds: 600,
@@ -62,7 +62,7 @@ function publicStations(config) {
         ellipsoidalHeightM: null, status: 'configured',
     }))];
 }
-function operations(file = path.join(__dirname, '..', 'logs', 'operations.json'), now = Date.now()) {
+function operations(file = OPERATIONS_PATH, now = Date.now()) {
     try {
         const value = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (!Number.isFinite(value.updatedAt) || now - value.updatedAt < -1000 || now - value.updatedAt >= 5000) return null;

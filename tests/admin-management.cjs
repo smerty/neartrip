@@ -200,3 +200,26 @@ test('settings saves and disk reloads permanently invalidate member cookies acro
         }
     } finally { await api.close(); }
 });
+
+test('operations override resolves from launch cwd for both absolute and relative snapshot paths', () => {
+    const { spawnSync } = require('node:child_process');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neartrip-operations-path-'));
+    try {
+        const file = path.join(dir, 'custom.json'), snapshot = { updatedAt: Date.now(), stats: { clients: [], bases: [] }, security: [] };
+        fs.writeFileSync(file, JSON.stringify(snapshot));
+        for (const override of ['custom.json', file]) {
+            const script = `const paths = require(${JSON.stringify(path.resolve(__dirname, '../utils/paths'))}); const management = require(${JSON.stringify(path.resolve(__dirname, '../utils/management'))}); process.chdir('/'); console.log(JSON.stringify({file:paths.OPERATIONS_PATH, data:management.operations()}));`;
+            const result = spawnSync(process.execPath, ['-e', script], { cwd: dir, env: { ...process.env, NEARTRIP_OPERATIONS: override }, encoding: 'utf8' });
+            assert.equal(result.status, 0, result.stderr);
+            const actual = JSON.parse(result.stdout);
+            assert.equal(actual.file, file); assert.deepEqual(actual.data, snapshot);
+        }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('native login submission cannot place named credentials in a GET URL', () => {
+    const html = fs.readFileSync(path.join(__dirname, '../web/public/login.html'), 'utf8');
+    const form = html.match(/<form\b[^>]*id="loginForm"[^>]*>/)[0];
+    assert.match(form, /method="post"/i);
+    assert.match(form, /action="\/login"/i);
+});

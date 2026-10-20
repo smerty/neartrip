@@ -23,8 +23,9 @@ const LINE_LIMIT: usize = 1024;
 const HANDSHAKE_LIMIT: usize = 8192;
 
 struct Upstream {
-    read: OwnedReadHalf,
-    write: OwnedWriteHalf,
+    read: Option<OwnedReadHalf>,
+    write: Option<OwnedWriteHalf>,
+    direct: Option<tokio::sync::broadcast::Receiver<Vec<u8>>>,
     mount: String,
     last_data: tokio::time::Instant,
     connected_at: Instant,
@@ -54,7 +55,24 @@ pub async fn serve(
     listener: TcpListener,
     configs: watch::Receiver<Config>,
     registry: Arc<Registry>,
+    shutdown: watch::Receiver<bool>,
+) {
+    serve_with_hub(
+        listener,
+        configs,
+        registry,
+        shutdown,
+        Arc::new(crate::caster::Hub::default()),
+    )
+    .await;
+}
+
+pub async fn serve_with_hub(
+    listener: TcpListener,
+    configs: watch::Receiver<Config>,
+    registry: Arc<Registry>,
     mut shutdown: watch::Receiver<bool>,
+    hub: Arc<crate::caster::Hub>,
 ) {
     let mut clients = tokio::task::JoinSet::new();
     loop {
@@ -68,6 +86,7 @@ pub async fn serve(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((socket, peer)) => {
+                        let hub = hub.clone();
                         let configs = configs.clone();
                         let registry = Arc::clone(&registry);
                         let mut shutdown = shutdown.clone();
@@ -75,7 +94,7 @@ pub async fn serve(
                             let live = registry.open(peer).await;
                             let reason = tokio::select! {
                                 _ = shutdown.changed() => "core shutdown".to_string(),
-                                reason = handle_client(socket, peer, configs, &registry, &live) => reason,
+                                reason = handle_client(socket, peer, configs, &registry, &live, &hub) => reason,
                             };
                             registry.close_with_reason(&live.id, &reason);
                         });
@@ -97,11 +116,12 @@ async fn handle_client(
     configs: watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
 ) -> String {
     let _ = socket.set_nodelay(true);
     let id = &live.id;
     tracing::info!(%id, %peer, "client connected");
-    let reason = session(socket, configs, registry, live)
+    let reason = session(socket, configs, registry, live, hub)
         .await
         .err()
         .unwrap_or_else(|| "sourcetable served".into());
@@ -114,6 +134,7 @@ async fn session(
     configs: watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
 ) -> Result<(), String> {
     let (mut client_read, mut client_write) = socket.into_split();
     let mut incoming = Vec::new();
@@ -125,8 +146,23 @@ async fn session(
         if let Some(split_at) = find_subsequence(&incoming, b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&incoming[..split_at]).into_owned();
             let rest = incoming[split_at + 4..].to_vec();
+            if let Some(result) = crate::caster::route(
+                &head,
+                &rest,
+                &configs,
+                hub,
+                &mut client_read,
+                &mut client_write,
+                registry,
+                live,
+            )
+            .await
+            {
+                return result;
+            }
             match dispatch_request(&head, &configs) {
-                RequestAction::Sourcetable(body) => {
+                RequestAction::Sourcetable => {
+                    let body = sourcetable(&hub.located_config(&configs.borrow()));
                     client_write
                         .write_all(body.as_bytes())
                         .await
@@ -145,7 +181,16 @@ async fn session(
                         .write_all(b"ICY 200 OK\r\n\r\n")
                         .await
                         .map_err(|e| e.to_string())?;
-                    return stream(client_read, client_write, rest, configs, registry, live).await;
+                    return stream(
+                        client_read,
+                        client_write,
+                        rest,
+                        configs,
+                        registry,
+                        live,
+                        hub,
+                    )
+                    .await;
                 }
             }
         }
@@ -156,7 +201,7 @@ async fn session(
 }
 
 enum RequestAction {
-    Sourcetable(String),
+    Sourcetable,
     Reject(String),
     Stream,
 }
@@ -167,7 +212,7 @@ fn dispatch_request(head: &str, configs: &watch::Receiver<Config>) -> RequestAct
         return RequestAction::Reject("HTTP/1.1 400 Bad Request\r\n\r\n".into());
     };
     if request.path == "/" {
-        return RequestAction::Sourcetable(sourcetable(&config));
+        return RequestAction::Sourcetable;
     }
     let mount = request.path.trim_end_matches('/');
     if mount != format!("/{}", config.mount_point) {
@@ -205,7 +250,7 @@ fn parse_request(head: &str) -> Option<ClientRequest> {
     Some(ClientRequest { path, auth })
 }
 
-fn decode_basic(value: &str) -> Option<(String, String)> {
+pub(crate) fn decode_basic(value: &str) -> Option<(String, String)> {
     let encoded = value
         .strip_prefix("Basic ")
         .or_else(|| value.strip_prefix("basic "))?;
@@ -217,7 +262,7 @@ fn decode_basic(value: &str) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> bool {
+pub(crate) fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> bool {
     let Some((user, pass)) = auth else {
         return false;
     };
@@ -232,7 +277,7 @@ fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> bool {
         & ct_eq(pass.as_bytes(), config.password.as_bytes())
 }
 
-fn ct_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let n = left.len().max(right.len());
     for i in 0..n {
@@ -250,6 +295,7 @@ async fn stream(
     configs: watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
 ) -> Result<(), String> {
     let mut line_buf = pending;
     // Inline arrays live in every suspended rover task. Keep them bounded;
@@ -260,6 +306,7 @@ async fn stream(
     let mut last_fail: Option<(String, Instant)> = None;
     let mut latest_gga = None;
     let mut attempt = None;
+    let mut health_tick = tokio::time::interval(Duration::from_secs(1));
     let mut client_deadline = tokio::time::Instant::now() + READ_IDLE;
 
     loop {
@@ -273,13 +320,14 @@ async fn stream(
                 &configs,
                 registry,
                 live,
+                hub,
                 &mut upstream,
                 &mut attempt,
                 &mut last_fail,
                 &mut latest_gga,
             )
             .await;
-            recover_upstream(&configs, registry, live, &mut upstream,
+            recover_upstream(&configs, registry, live, hub, &mut upstream,
                 &mut attempt, &mut last_fail, latest_gga.as_ref()).await;
             let retry_at = if latest_gga.is_some() && attempt.is_none() {
                 last_fail.as_ref().map(|(_, when)| *when + RETRY_AFTER)
@@ -287,6 +335,14 @@ async fn stream(
                 None
             };
             let client_n = tokio::select! {
+                _ = health_tick.tick() => {
+                    if !configs.borrow().sources.is_empty() || upstream.as_ref().is_some_and(|s| s.direct.is_some()) {
+                        if let Some(gga) = latest_gga.as_ref() {
+                            ensure_upstream(&configs, registry, live, hub, &mut upstream, &mut attempt, &mut last_fail, gga).await;
+                        }
+                    }
+                    None
+                }
                 result = poll_attempt(&mut attempt) => {
                     let completed = attempt.take().expect("completed dial");
                     match result {
@@ -370,6 +426,7 @@ async fn recover_upstream(
     configs: &watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
     upstream: &mut Option<Upstream>,
     attempt: &mut Option<ConnectAttempt>,
     last_fail: &mut Option<(String, Instant)>,
@@ -385,9 +442,15 @@ async fn recover_upstream(
     if upstream.is_none() || retry_due {
         if let Some(gga) = latest_gga {
             let had_upstream = upstream.is_some();
-            ensure_upstream(configs, registry, live, upstream, attempt, last_fail, gga).await;
+            ensure_upstream(
+                configs, registry, live, hub, upstream, attempt, last_fail, gga,
+            )
+            .await;
             if had_upstream && upstream.is_none() && last_fail.is_none() {
-                ensure_upstream(configs, registry, live, upstream, attempt, last_fail, gga).await;
+                ensure_upstream(
+                    configs, registry, live, hub, upstream, attempt, last_fail, gga,
+                )
+                .await;
             }
         }
     }
@@ -398,6 +461,7 @@ async fn drain_lines(
     configs: &watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
     upstream: &mut Option<Upstream>,
     attempt: &mut Option<ConnectAttempt>,
     last_fail: &mut Option<(String, Instant)>,
@@ -419,7 +483,10 @@ async fn drain_lines(
                 gga.num_satellites,
             );
             *latest_gga = Some(gga.clone());
-            ensure_upstream(configs, registry, live, upstream, attempt, last_fail, &gga).await;
+            ensure_upstream(
+                configs, registry, live, hub, upstream, attempt, last_fail, &gga,
+            )
+            .await;
         }
     }
     if line_buf.len() > LINE_LIMIT {
@@ -431,17 +498,29 @@ async fn ensure_upstream(
     configs: &watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
+    hub: &crate::caster::Hub,
     upstream: &mut Option<Upstream>,
     attempt: &mut Option<ConnectAttempt>,
     last_fail: &mut Option<(String, Instant)>,
     gga: &crate::nmea::Gga,
 ) {
     let config = configs.borrow().clone();
+    if upstream.as_ref().is_some_and(|s| {
+        s.direct.is_some()
+            && (!config
+                .sources
+                .iter()
+                .any(|source| source.mount_point == s.mount && hub.ready(source)))
+    }) {
+        *upstream = None;
+        *last_fail = None;
+    }
     let current_mount = upstream.as_ref().map(|link| link.mount.clone());
+    let stations = hub.stations(&config);
     let Some(chosen) = select_station(
         gga.latitude,
         gga.longitude,
-        &config.stations,
+        &stations,
         current_mount.as_deref(),
         SWITCH_MARGIN_M,
     ) else {
@@ -477,6 +556,27 @@ async fn ensure_upstream(
         return;
     }
     if current_mount.as_deref() == Some(mount.as_str()) {
+        return;
+    }
+    if config.sources.iter().any(|s| s.mount_point == mount) {
+        if let Some(receiver) = hub.subscribe(&mount) {
+            *attempt = None;
+            *last_fail = None;
+            *upstream = Some(Upstream {
+                read: None,
+                write: None,
+                direct: Some(receiver),
+                mount: mount.clone(),
+                last_data: Instant::now(),
+                connected_at: Instant::now(),
+                session_id: live.id.clone(),
+                bytes_received: 0,
+                gga_pending: Vec::new(),
+                gga_latest: None,
+            });
+            registry.station(&live.id, &mount);
+            registry.upstream(&live.id, "connected", None);
+        }
         return;
     }
     if last_fail
@@ -528,8 +628,9 @@ async fn ensure_upstream(
             let (read, write) = link.stream.into_split();
             Ok((
                 Upstream {
-                    read,
-                    write,
+                    read: Some(read),
+                    write: Some(write),
+                    direct: None,
                     mount: station.mount_point,
                     last_data: Instant::now(),
                     connected_at: Instant::now(),
@@ -551,6 +652,9 @@ async fn forward_gga(
     let Some(link) = upstream.as_mut() else {
         return Ok(());
     };
+    if link.direct.is_some() {
+        return Ok(());
+    }
     link.gga_latest = Some(format!("{}\r\n", gga.sentence).into_bytes());
     flush_gga(link)
 }
@@ -563,7 +667,12 @@ fn flush_gga(link: &mut Upstream) -> std::io::Result<()> {
             };
             link.gga_pending = next;
         }
-        match link.write.try_write(&link.gga_pending) {
+        match link
+            .write
+            .as_ref()
+            .expect("remote writer")
+            .try_write(&link.gga_pending)
+        {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => {
                 link.gga_pending.drain(..n);
@@ -577,12 +686,27 @@ fn flush_gga(link: &mut Upstream) -> std::io::Result<()> {
 async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::io::Result<usize> {
     match upstream.as_mut() {
         Some(link) => {
+            if let Some(receiver) = link.direct.as_mut() {
+                let data = receiver.recv().await.map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())
+                })?;
+                if data.len() > buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "source chunk too large",
+                    ));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                link.last_data = Instant::now();
+                link.bytes_received += data.len() as u64;
+                return Ok(data.len());
+            }
             let deadline = link.last_data + READ_IDLE;
             let io = async {
                 loop {
                     tokio::select! {
-                        n = link.read.read(buf) => return n,
-                        ready = link.write.writable(), if !link.gga_pending.is_empty() => {
+                        n = link.read.as_mut().expect("remote reader").read(buf) => return n,
+                        ready = link.write.as_ref().expect("remote writer").writable(), if !link.gga_pending.is_empty() => {
                             ready?;
                             flush_gga(link)?;
                         }
@@ -651,8 +775,9 @@ mod tests {
         // Force a deterministic write failure without relying on TCP reset timing.
         write.shutdown().await.unwrap();
         let mut upstream = Some(Upstream {
-            read,
-            write,
+            read: Some(read),
+            write: Some(write),
+            direct: None,
             mount: "A".into(),
             last_data: Instant::now(),
             connected_at: Instant::now(),
@@ -696,6 +821,7 @@ mod tests {
                 &configs,
                 &registry,
                 &live,
+                &crate::caster::Hub::default(),
                 &mut upstream,
                 &mut attempt,
                 &mut last_fail,
@@ -712,6 +838,7 @@ mod tests {
                 &configs,
                 &registry,
                 &live,
+                &crate::caster::Hub::default(),
                 &mut upstream,
                 &mut attempt,
                 &mut last_fail,

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use neartrip::config::{publish_reload, Config};
 use neartrip::registry::Registry;
-use neartrip::server::serve;
+use neartrip::{caster::Hub, server::serve_with_hub};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -79,7 +79,17 @@ async fn main() {
         let _ = shutdown_tx.send(true);
     });
 
-    serve(listener, config_rx, registry.clone(), shutdown_rx).await;
+    let hub = Arc::new(Hub::default());
+    let health_path = env::var("NEARTRIP_SOURCES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("logs/sources.json"));
+    let health_task = tokio::spawn(hub.clone().snapshots(
+        health_path,
+        config_rx.clone(),
+        shutdown_rx.clone(),
+    ));
+    serve_with_hub(listener, config_rx, registry.clone(), shutdown_rx, hub).await;
+    let _ = health_task.await;
     registry.flush();
 }
 

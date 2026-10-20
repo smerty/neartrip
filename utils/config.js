@@ -21,6 +21,7 @@ const DEFAULT_CONFIG = {
     adminPort: 3000,
     adminUsername: "admin",
     adminPassword: "admin",
+    sources: [],
     stations: []
 };
 

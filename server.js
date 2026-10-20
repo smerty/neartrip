@@ -62,6 +62,7 @@ function startCore() {
             ...process.env,
             NEARTRIP_CONFIG: path.join(root, 'config.json'),
             NEARTRIP_SESSIONS: path.join(root, 'logs', 'sessions.json'),
+            NEARTRIP_SOURCES: path.join(root, 'logs', 'sources.json'),
         },
     });
     child.on('error', (error) => {

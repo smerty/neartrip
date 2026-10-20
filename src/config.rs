@@ -24,6 +24,8 @@ pub struct Config {
     pub user_agent: String,
     #[serde(default)]
     pub stations: Vec<Station>,
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 /// Rover accounts. A nonempty list replaces the legacy shared credentials.
@@ -51,6 +53,32 @@ pub struct Station {
     pub active: bool,
 }
 
+/// Direct publishers use credentials separate from rover accounts.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    pub mount_point: String,
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    #[serde(default = "default_settling")]
+    pub settling_seconds: u64,
+    #[serde(default = "default_tolerance")]
+    pub position_tolerance_m: f64,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_settling() -> u64 {
+    60
+}
+fn default_tolerance() -> f64 {
+    5.0
+}
+
 fn default_interface() -> String {
     "0.0.0.0".to_string()
 }
@@ -73,7 +101,54 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(text)
+        let config: Self = serde_json::from_str(text)?;
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut mounts = std::collections::HashSet::new();
+        mounts.insert(self.mount_point.as_str());
+        for station in &self.stations {
+            mounts.insert(station.mount_point.as_str());
+        }
+        for source in &self.sources {
+            if source.mount_point.is_empty()
+                || !source
+                    .mount_point
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                || !mounts.insert(source.mount_point.as_str())
+            {
+                return Err(
+                    "source mountpoints must be unique and use letters, digits, _, - or .".into(),
+                );
+            }
+            if source.password.is_empty() {
+                return Err("source password must not be empty".into());
+            }
+            if source.settling_seconds > 86400 {
+                return Err("settlingSeconds must be between 0 and 86400".into());
+            }
+            if !source.position_tolerance_m.is_finite()
+                || source.position_tolerance_m <= 0.0
+                || source.position_tolerance_m > 10000.0
+            {
+                return Err("positionToleranceM must be greater than 0 and at most 10000".into());
+            }
+            match (source.latitude, source.longitude) {
+                (None, None) => {}
+                (Some(lat), Some(lon))
+                    if lat.is_finite()
+                        && lon.is_finite()
+                        && (-90.0..=90.0).contains(&lat)
+                        && (-180.0..=180.0).contains(&lon) => {}
+                _ => {
+                    return Err("source coordinates must be a valid latitude/longitude pair".into())
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -126,6 +201,46 @@ mod tests {
         assert_eq!(config.mount_point, "NEAR");
         assert!(config.stations[0].active);
         assert_eq!(config.port, 2101);
+    }
+
+    #[test]
+    fn validates_source_coordinates_credentials_and_namespaces() {
+        let valid = r#"{"mountPoint":"NEAR","sources":[{"mountPoint":"BASE","username":"b","password":"s","latitude":0,"longitude":0}]}"#;
+        assert!(Config::parse(valid).is_ok());
+        for invalid in [
+            valid.replace("\"mountPoint\":\"BASE\"", "\"mountPoint\":\"NEAR\""),
+            valid.replace("\"latitude\":0", "\"latitude\":91"),
+            valid.replace("\"longitude\":0", "\"longitude\":null"),
+            valid.replace("\"password\":\"s\"", "\"password\":\"\""),
+            valid.replace("\"mountPoint\":\"BASE\"", "\"mountPoint\":\"bad/name\""),
+        ] {
+            assert!(Config::parse(&invalid).is_err(), "{invalid}");
+        }
+        let parsed = Config::parse(valid).unwrap();
+        let (tx, rx) = watch::channel(parsed.clone());
+        publish_reload(&tx, &valid.replace("\"latitude\":0", "\"latitude\":91"));
+        assert_eq!(*rx.borrow(), parsed);
+    }
+
+    #[test]
+    fn onboarding_defaults_and_bounds_are_validated() {
+        let raw = r#"{"sources":[{"mountPoint":"BASE","username":"b","password":"s"}]}"#;
+        let source = Config::parse(raw).unwrap().sources.remove(0);
+        assert_eq!(source.settling_seconds, 60);
+        assert_eq!(source.position_tolerance_m, 5.0);
+        for fields in [
+            r#","settlingSeconds":-1"#,
+            r#","settlingSeconds":1.5"#,
+            r#","settlingSeconds":86401"#,
+            r#","settlingSeconds":null"#,
+            r#","positionToleranceM":0"#,
+            r#","positionToleranceM":10001"#,
+        ] {
+            let invalid = raw.replace(r#""password":"s""#, &format!(r#""password":"s"{fields}"#));
+            assert!(Config::parse(&invalid).is_err(), "{invalid}");
+        }
+        let zero = raw.replace(r#""password":"s""#, r#""password":"s","settlingSeconds":0"#);
+        assert_eq!(Config::parse(&zero).unwrap().sources[0].settling_seconds, 0);
     }
 
     #[test]

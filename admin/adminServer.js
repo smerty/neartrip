@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const logger = require('../utils/logger');
 const configManager = require('../utils/config');
+const { validateSources, publicSource, sourceHealth } = require('../utils/sources');
 
 // Store all connections (active and historical) for the admin interface
 const connections = new Map();
@@ -89,6 +90,55 @@ function initAdminServer(options = {}) {
  * @param {express.Application} app - Express app
  */
 function setupApiRoutes(app) {
+    app.get('/api/sources', (req, res) => {
+        res.json(sourceHealth(configManager.getConfig()));
+    });
+    app.post('/api/sources', (req, res) => {
+        const config = configManager.getConfig();
+        const source = {
+            mountPoint: req.body.mountPoint, username: req.body.username,
+            password: req.body.password, latitude: req.body.latitude ?? null,
+            longitude: req.body.longitude ?? null, active: req.body.active ?? true,
+            settlingSeconds: req.body.settlingSeconds === undefined ? 60 : req.body.settlingSeconds,
+            positionToleranceM: req.body.positionToleranceM === undefined ? 5 : req.body.positionToleranceM,
+        };
+        const next = { ...config, sources: [...(config.sources || []), source] };
+        const error = validateSources(next);
+        if (error) return res.status(400).json({ error });
+        try { saveConfig(next); res.status(201).json(publicSource(source)); }
+        catch { res.status(500).json({ error: 'Failed to save publisher' }); }
+    });
+    app.put('/api/sources/:mountPoint', (req, res) => {
+        const config = configManager.getConfig();
+        const existing = (config.sources || []).find(s => s.mountPoint === req.params.mountPoint);
+        if (!existing) return res.status(404).json({ error: 'Publisher not found' });
+        const source = {
+            mountPoint: existing.mountPoint,
+            username: req.body.username ?? existing.username,
+            password: req.body.password === '' || req.body.password === undefined ? existing.password : req.body.password,
+            latitude: req.body.latitude === undefined ? existing.latitude : req.body.latitude,
+            longitude: req.body.longitude === undefined ? existing.longitude : req.body.longitude,
+            active: req.body.active === undefined ? existing.active : req.body.active,
+            settlingSeconds: req.body.settlingSeconds === undefined ? (existing.settlingSeconds ?? 60) : req.body.settlingSeconds,
+            positionToleranceM: req.body.positionToleranceM === undefined ? (existing.positionToleranceM ?? 5) : req.body.positionToleranceM,
+        };
+        const next = { ...config, sources: config.sources.map(s => s === existing ? source : s) };
+        const error = validateSources(next);
+        if (error) return res.status(400).json({ error });
+        try { saveConfig(next); res.json(publicSource(source)); }
+        catch { res.status(500).json({ error: 'Failed to save publisher' }); }
+    });
+    app.delete('/api/sources/:mountPoint', (req, res) => {
+        const config = configManager.getConfig();
+        if (!(config.sources || []).some(s => s.mountPoint === req.params.mountPoint)) {
+            return res.status(404).json({ error: 'Publisher not found' });
+        }
+        try {
+            saveConfig({ ...config, sources: config.sources.filter(s => s.mountPoint !== req.params.mountPoint) });
+            res.json({ deleted: true });
+        } catch { res.status(500).json({ error: 'Failed to delete publisher' }); }
+    });
+
     // Get all stations
     app.get('/api/stations', (req, res) => {
         try {
@@ -124,6 +174,9 @@ function setupApiRoutes(app) {
                 newStation.active = true;
             }
 
+            if (validateSources({ ...config, stations: [...config.stations, newStation] })) {
+                return res.status(400).json({ error: 'Mountpoint conflicts with a direct source' });
+            }
             // Add the new station
             config.stations.push(newStation);
             
@@ -151,6 +204,9 @@ function setupApiRoutes(app) {
                 return res.status(404).json({ error: 'Station not found' });
             }
 
+            if (validateSources({ ...config, stations: config.stations.map((s, i) => i === index ? updatedStation : s) })) {
+                return res.status(400).json({ error: 'Mountpoint conflicts with a direct source' });
+            }
             // Update the station
             config.stations[index] = updatedStation;
             
@@ -235,7 +291,8 @@ function setupApiRoutes(app) {
     app.get('/api/info', (req, res) => {
         try {
             const config = configManager.getConfig();
-            const { username, password, users, adminPassword, ...safeConfig } = config;
+            const { username, password, users, adminPassword, sources, ...safeConfig } = config;
+            safeConfig.sources = (sources || []).map(publicSource);
             res.json({
                 version: require('../package.json').version,
                 config: safeConfig,
@@ -270,6 +327,8 @@ function setupApiRoutes(app) {
                 return res.status(400).json({ error: 'Invalid configuration format' });
             }
             
+            const sourceError = validateSources(newConfig);
+            if (sourceError) return res.status(400).json({ error: sourceError });
             // Save the new config
             saveConfig(newConfig);
             
@@ -368,8 +427,21 @@ function connectionLogPath(id, connection) {
 }
 
 function saveConfig(config) {
-    const configPath = configManager.CONFIG_FILE_PATH;
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 4));
+    // Docker links config.json into its persistent configuration volume.
+    const configPath = fs.realpathSync(configManager.CONFIG_FILE_PATH);
+    const error = validateSources(config);
+    if (error) throw new Error(error);
+    const mode = fs.statSync(configPath).mode & 0o777;
+    // A private, unique directory also avoids following a leftover temp symlink.
+    const tempDir = fs.mkdtempSync(path.join(path.dirname(configPath), '.neartrip-config-'));
+    const temp = path.join(tempDir, 'config.json');
+    try {
+        fs.writeFileSync(temp, JSON.stringify(config, null, 4), { flag: 'wx', mode });
+        fs.renameSync(temp, configPath);
+    } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+    configManager.reloadConfig();
     logger.info('Configuration saved successfully');
 }
 

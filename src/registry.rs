@@ -230,6 +230,15 @@ impl Registry {
         LiveSession { id, nmea: tx }
     }
 
+    pub fn publisher(&self, id: &str) {
+        self.with_mut(|sessions| {
+            if let Some(session) = sessions.get_mut(id) {
+                session.status = "publishing".into();
+                session.read_idle_timeout_secs = 30;
+            }
+        });
+    }
+
     pub fn position(&self, id: &str, lat: f64, lon: f64, fix_quality: u32, satellites: u32) {
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {

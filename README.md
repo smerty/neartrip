@@ -180,3 +180,147 @@ it. Live sessions are retained regardless of age.
 Run the core and dashboard regression suites with `cargo test` and
 `npm run test:admin`. The core tests use local mock casters and virtual time to
 exercise long-lived rovers and idle timeouts without external NTRIP services.
+
+### Direct base-station uploads
+
+NearTRIP accepts base-station correction streams directly, without an upstream
+caster. In **Stations → Direct Base Stations**, add a publisher with a unique
+mountpoint, username, and password. Position is automatically detected from
+CRC-checked RTCM 1005/1006 messages in the upload. The dashboard
+can edit credentials and coordinates, enable or disable publishers, and delete
+them. Leaving the password blank when editing preserves it. Optional manual
+coordinates serve as a fallback until a valid base-position message arrives.
+Detected coordinates take precedence and are not written into configuration.
+If neither detected nor manual coordinates are available, the source can still
+serve its fixed mountpoint but waits to participate in nearest selection.
+
+The dashboard displays antenna reference point latitude, longitude, and height
+above the WGS84 ellipsoid, plus the separate antenna-height field when provided
+by message 1006. Ellipsoidal height is not elevation above sea level; that would
+require a geoid model. We do not add the antenna-height field to the already
+reported antenna reference point height. Configure the base to periodically
+send 1005 or 1006; observation messages alone cannot supply its position.
+Detection starts fresh for each upload connection, so a reconnect cannot inherit
+a previous publisher's position. RTCM bytes are inspected without being changed.
+Field layouts follow the [RTKLIB decoder](https://github.com/tomojitakasu/RTKLIB/blob/master/src/rtcm3.c).
+
+The equivalent configuration in `config.json` or the Settings JSON editor is:
+
+```json
+"sources": [
+  {
+    "mountPoint": "MY_BASE",
+    "username": "base1",
+    "password": "replace-with-a-secret",
+    "latitude": 37.123,
+    "longitude": -122.456,
+    "settlingSeconds": 60,
+    "positionToleranceM": 5,
+    "active": true
+  }
+]
+```
+
+Configure the base's NTRIP server/upload mode with host `rtk.k6sh.com`, the
+configured TCP port (default 2101), mountpoint `MY_BASE`, and the publisher's
+credentials. The hostname must point to the deployed server and its TCP port
+must be reachable. NTRIP v1 `SOURCE` uses the publisher password; NTRIP v2
+`POST` uses Basic authentication. Chunked uploads are currently rejected (501);
+use an unchunked upload mode. A POST with `Content-Length` ends at that body
+boundary and releases its mountpoint; bytes after the body are discarded and
+the connection is closed rather than reused for another request. Invalid or
+duplicate length headers are rejected before accepting an upload. POST without
+a length and legacy SOURCE uploads continue until disconnection or idle timeout.
+The listener is plain TCP; transport encryption
+requires compatible TLS termination or a trusted network.
+
+Rovers use their normal rover credentials. Request `MY_BASE` for a fixed base
+(no GGA required), or the existing virtual mountpoint for nearest-station
+selection using GGA. Active direct mountpoints appear in the sourcetable.
+Offline fixed mountpoints return 503, and duplicate publishers return 409.
+Publisher mountpoints must be distinct from the virtual mountpoint and all
+upstream stations; use letters, digits, underscores, periods, and hyphens.
+The reserved names `.` and `..` are rejected.
+
+### Direct-source onboarding
+
+Each direct source has an independent onboarding status, shown alongside stream
+health in **Stations → Direct Base Stations**:
+
+- **Detecting:** waiting for stream data or a reported/manual position.
+- **Settling:** checking the position over the configured settling period, with
+  a countdown.
+- **Ready:** eligible for automatic nearest-station selection while data remains
+  fresh.
+- **Needs attention:** offline, disabled, stale, position changed, or waiting for
+  a confirming position report. The dashboard shows the reason.
+- **Unknown:** core onboarding data is missing, expired, or uses different
+  settings than the current configuration.
+
+Edit a publisher's **Settling period (seconds)** and **Position tolerance (meters)**
+in the dashboard or set `settlingSeconds` and `positionToleranceM` in its source
+configuration. Defaults are 60 seconds and 5 meters. Settling accepts whole seconds
+from 0 to 86400; tolerance must be greater than zero and at most 10000 meters.
+Setting the period to zero skips the settling delay; position and fresh traffic
+are still required.
+
+For detected RTCM positions, a valid 1005/1006 report must confirm the position
+at or after the end of the settling period. A single position message followed
+by other traffic cannot establish position stability. If confirmation has not
+arrived, the source shows **Needs attention** until a valid report arrives.
+Manual fallback coordinates qualify after the period of continuous fresh data;
+the administrator is responsible for those coordinates.
+
+Positions are compared with the first position in the current qualification
+window. Movement beyond the tolerance (horizontal distance combined with
+ellipsoidal height change), a changed RTCM station ID, or a switch from manual
+coordinates to a reported station position restarts qualification. Comparing
+against an anchor also catches gradual drift. Movement removes a previously
+ready source from nearest selection; clients can use another ready direct base
+or an upstream station while it requalifies.
+
+A gap of 10 seconds without data interrupts qualification; resumed data starts
+a new settling period. Reconnection, restart, and publisher configuration edits
+also start fresh. Fixed mountpoint clients remain available throughout onboarding
+for diagnostics; onboarding gates automatic nearest selection only. This checks
+reported position and traffic stability, not survey-in completion or coordinate
+accuracy, and does not modify or average the base's correction messages.
+
+Nearest selection combines upstream `stations` with enabled direct sources
+that are **Ready**, have detected or fallback coordinates, and have received data
+in the last 10 seconds. The existing
+500-meter switch margin applies. Every second, source health is reevaluated
+using the latest valid rover GGA, allowing failover and recovery without another
+position report. Rover input still has the existing 120-second idle limit;
+health checks do not extend it. When no base is available, the nearest connection
+waits for a healthy source rather than replaying old corrections.
+
+The dashboard refreshes source health every five seconds:
+- **Waiting:** publisher connected but no data received.
+- **Healthy:** data received less than 10 seconds ago.
+- **Stale:** publisher connected, but data is at least 10 seconds old.
+- **Offline:** no publisher connected.
+- **Disabled:** publisher account disabled.
+- **Unknown:** the core health snapshot is unavailable or at least five seconds old.
+
+Health reports last data time, bytes received during the current/last upload,
+subscriber count, and the last disconnect error. Health means data is arriving;
+CRC checks on position messages do not establish surveyed accuracy or validate
+the remaining correction messages.
+The core atomically writes credential-free `logs/sources.json` every second
+(overridable with `NEARTRIP_SOURCES` when running the core separately); the Node
+launcher uses the shared logs directory. Source health starts fresh on restart,
+unlike rover session history.
+
+No data for 30 seconds disconnects the upload and its fixed subscribers.
+Nearest clients can fail over earlier when data becomes stale. Each upload
+feeds multiple rovers through bounded queues; streams are live only and are
+never replayed. Disabling, deleting, or changing a publisher's account or
+coordinates or onboarding settings closes its upload on config reload (normally within one second).
+Its base must reconnect using the new settings. Fixed clients must reconnect
+after their source goes away; nearest clients select another available station.
+Existing upstream station support remains available during migration.
+
+Run `cargo test` and `npm run test:admin` for the source health, fan-out,
+nearest switching, onboarding admission/movement/recovery, stale-source
+failover/recovery, and admin API regressions.

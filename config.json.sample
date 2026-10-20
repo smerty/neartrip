@@ -25,5 +25,6 @@
             "latitude": 34.567,
             "longitude": -123.456
         }
-    ]
+    ],
+    "sources": []
 }

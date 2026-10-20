@@ -438,7 +438,9 @@ sender, or public URL, no emails are sent. Delivery failures are logged without
 recipient addresses or tokens. Docker Compose forwards all variables above.
 
 Members use **My rover credentials** (`/rovers`) to create up to ten credentials,
-rotate generated passwords, or enable/disable individual rovers. Generated
+rotate generated passwords, enable/disable individual rovers, or delete unused
+credentials. Deleting credentials revokes access and frees a slot in the ten-rover
+limit; active streams disconnect on the next core policy check (about one second). Generated
 passwords are displayed once. Ownership is assigned on the server.
 
 Disabling a member immediately invalidates dashboard sessions and blocks their

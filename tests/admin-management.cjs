@@ -82,7 +82,7 @@ test('station directory requires member or admin authentication and exposes only
         assert.equal((await api.request('/api/public/stations')).status, 401);
         assert.match((await api.request('/index.html')).body, /Contact your network administrator/); // fetch follows redirect to login
         const page = await api.request('/', { auth: true });
-        assert.equal(page.status, 200); assert.match(page.body, /Precision starts nearby/);
+        assert.equal(page.status, 200); assert.match(page.body, /Base stations/);
         const directory = await api.request('/api/public/stations', { auth: true });
         assert.equal(directory.status, 200); assert.equal(directory.body.length, 2);
         const serialized = JSON.stringify(directory.body);
@@ -377,4 +377,30 @@ test('magic links require an invited active email, expire, and are single use', 
         await api.request('/api/members/alice', { auth: true, method: 'PUT', body: { active: true } });
         assert.equal((await verify(revoked)).status, 401, 'disable revokes pending link permanently');
     } finally { Date.now = now; await api.close(); }
+});
+
+test('members can delete only their own rover credentials and reclaim a full account slot', async () => {
+    const api = fixture();
+    try {
+        for (const username of ['alice', 'bob']) await api.request('/api/members', { auth: true, method: 'POST', body: { username, email: username + '@example.com' } });
+        const alice = await api.login('alice'), bob = await api.login('bob');
+        const aliceCsrf = (await api.request('/api/member/me', { cookie: alice.cookie })).body.csrf;
+        const bobCsrf = (await api.request('/api/member/me', { cookie: bob.cookie })).body.csrf;
+        const create = () => api.request('/api/member/rovers', { cookie: alice.cookie, csrf: aliceCsrf, method: 'POST', body: {} });
+        const first = await create(), url = '/api/member/rovers/' + first.body.username;
+        for (let i = 1; i < 10; i++) assert.equal((await create()).status, 201);
+        assert.equal((await create()).status, 400);
+        assert.equal((await api.request(url, { method: 'DELETE' })).status, 401);
+        assert.equal((await api.request(url, { cookie: alice.cookie, method: 'DELETE' })).status, 403);
+        assert.equal((await api.request(url, { cookie: bob.cookie, csrf: bobCsrf, method: 'DELETE' })).status, 404);
+        const remove = () => api.request(url, { cookie: alice.cookie, csrf: aliceCsrf, method: 'DELETE' });
+        assert.equal((await remove()).status, 200);
+        assert.equal(api.config().users.some(u => u.username === first.body.username), false);
+        assert.equal((await api.request('/api/member/rovers', { cookie: alice.cookie })).body.users.length, 9);
+        assert.equal((await remove()).status, 404);
+        assert.equal((await create()).status, 201, 'deletion frees capacity');
+        for (const u of [...api.config().users]) await api.request('/api/member/rovers/' + u.username, { cookie: alice.cookie, csrf: aliceCsrf, method: 'DELETE' });
+        assert.equal(api.config().users.length, 0);
+        assert.equal((await api.request('/api/users', { auth: true })).body.mode, 'accounts', 'members keep anonymous fallback disabled');
+    } finally { await api.close(); }
 });

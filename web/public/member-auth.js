@@ -1,5 +1,5 @@
 (() => {
-    let csrf, busy = false;
+    let csrf, busy = false, displayedUsername;
     const message = document.getElementById('message');
     async function api(path, method = 'GET', body) {
         const res = await fetch('/api/member/' + path, { method, headers: { 'Content-Type': 'application/json', ...(csrf ? { 'X-CSRF-Token': csrf } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -44,7 +44,7 @@
         }
         return;
     }
-    const secret = data => { const el = document.getElementById('newCredentials'); el.hidden = false; el.textContent = 'Username: ' + data.username + '\nPassword: ' + data.password + '\nCopy now — this password will not be displayed again.'; el.focus(); };
+    const secret = data => { displayedUsername = data.username; const el = document.getElementById('newCredentials'); el.hidden = false; el.textContent = 'Username: ' + data.username + '\nPassword: ' + data.password + '\nCopy now — this password will not be displayed again.'; el.focus(); };
     async function load() {
         const data = await api('rovers'), root = document.getElementById('rovers'); root.replaceChildren();
         document.getElementById('connectionInfo').textContent = 'Caster: ' + location.hostname + ' · Port: ' + data.port + ' · Nearest mountpoint: ' + data.mountPoint;
@@ -55,6 +55,19 @@
                 const button = document.createElement('button'); button.className = 'map-tool'; button.textContent = label; button.disabled = busy;
                 button.onclick = () => run(async () => { const result = await api('rovers/' + encodeURIComponent(rover.username), 'PUT', body); if (result.password) secret(result); await load(); }); row.append(button);
             }
+            const remove = document.createElement('button');
+            remove.className = 'map-tool'; remove.textContent = 'Delete'; remove.disabled = busy;
+            remove.onclick = () => {
+                if (busy || !window.confirm('Delete ' + rover.username + '? This revokes its access and cannot be undone.')) return;
+                return run(async () => {
+                    await api('rovers/' + encodeURIComponent(rover.username), 'DELETE');
+                    if (displayedUsername === rover.username) {
+                        const el = document.getElementById('newCredentials'); el.hidden = true; el.textContent = ''; displayedUsername = undefined;
+                    }
+                    await load();
+                });
+            };
+            row.append(remove);
             root.append(row);
         }
     }

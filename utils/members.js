@@ -133,6 +133,15 @@ function setupMembers(app, manager, save, admin) {
         try { save({ ...c, users: c.users.map(u => u === user ? updated : u) }); res.json({ username: updated.username, active: updated.active, ...(req.body?.rotate === true ? { password } : {}) }); }
         catch { res.status(400).json({ error: 'Unable to update rover' }); }
     });
+    app.delete('/api/member/rovers/:username', (req, res) => {
+        const c = manager.getConfig(), owner = req.memberSession.member.username;
+        const user = (c.users || []).find(u => u.username === req.params.username && u.owner === owner);
+        if (!user) return res.status(404).json({ error: 'Rover not found' });
+        try {
+            save({ ...c, users: c.users.filter(u => u !== user) });
+            res.json({ deleted: true });
+        } catch { res.status(400).json({ error: 'Unable to delete rover credentials' }); }
+    });
     return { guard, close() { unsubscribe?.(); }, setupAdmin() {
         app.get('/api/members', (_req, res) => res.json((manager.getConfig().members || []).map(safe)));
         const pending = new Set();

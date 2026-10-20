@@ -27,9 +27,11 @@ function fixture({ diskWatch = false } = {}) {
         vm.runInContext(fs.readFileSync(path.join(__dirname, '../utils/config.js'), 'utf8'), configContext);
         configManager = configContext.module.exports;
     }
+    const sent = [];
     const context = vm.createContext({
         __dirname: path.resolve(__dirname, '../admin'), module: { exports: {} }, setInterval, clearInterval,
         require(name) {
+            if (name === '../utils/members') return { setupMembers(app, manager, save, admin) { return require('../utils/members').setupMembers(app, manager, save, { ...admin, mailer: { async send(email, token) { sent.push({ email, token }); } } }); } };
             if (name === '../utils/config') return configManager;
             if (name === '../utils/logger') return { info() {}, debug() {}, error() {} };
             if (name === '../utils/management') return { ...management,
@@ -44,6 +46,17 @@ function fixture({ diskWatch = false } = {}) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../admin/adminServer.js'), 'utf8'), context);
     const { app, server } = context.module.exports.initAdminServer({ port: 0, username: 'admin', password: 'console-secret' });
     return {
+        sent,
+        async login(username = 'alice') {
+            const existing = sent.findLast(m => m.email === username + '@example.com');
+            if (!existing || existing.used) {
+                let result = await this.request('/api/member/login', { method: 'POST', body: { email: username + '@example.com' } });
+                if (result.status === 429) { await new Promise(r => setTimeout(r, 2100)); await this.request('/api/member/login', { method: 'POST', body: { email: username + '@example.com' } }); }
+            }
+            const mail = sent.findLast(m => m.email === username + '@example.com');
+            mail.used = true;
+            return this.request('/api/member/verify', { method: 'POST', body: { token: mail.token } });
+        },
         proxyTrust: () => app.get('trust proxy'),
         config: () => configManager.getConfig(), diskFile: configFile, onConfig: fn => configManager.subscribeConfig(fn), reload(config) { fs.writeFileSync(configFile, JSON.stringify(config)); configManager.reloadConfig(); }, setSnapshot(value) { snapshot = value; },
         async request(url, { auth = false, method = 'GET', body, cookie, csrf, forwarded } = {}) {
@@ -151,11 +164,11 @@ test('operations snapshots expire and management rejects invalid accounts and po
 test('members own rover credentials, cannot reach admin data, and lose sessions and rover access when disabled', async () => {
     const api = fixture(), admin = (method, body) => ({ auth: true, method, body });
     try {
-        assert.equal((await api.request('/api/members', admin('POST', { username: 'alice', password: 'long-member-password' }))).status, 201);
-        assert.equal((await api.request('/api/members', admin('POST', { username: 'bob', password: 'another-long-password' }))).status, 201);
-        assert.ok(api.config().members[0].passwordHash); assert.equal(api.config().members[0].password, undefined);
-        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'wrong' } })).status, 401);
-        const login = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } });
+        assert.equal((await api.request('/api/members', admin('POST', { username: 'alice', email: 'alice@example.com' }))).status, 201);
+        assert.equal((await api.request('/api/members', admin('POST', { username: 'bob', email: 'bob@example.com' }))).status, 201);
+        assert.equal(api.config().members[0].email, 'alice@example.com'); assert.equal(api.config().members[0].password, undefined);
+        assert.equal((await api.request('/api/member/verify', { method: 'POST', body: { token: 'bad' } })).status, 401);
+        const login = await api.login('alice');
         assert.equal(login.status, 200); const cookie = login.cookie;
         const me = await api.request('/api/member/me', { cookie }); const csrf = me.body.csrf;
         assert.equal(me.body.username, 'alice');
@@ -168,7 +181,7 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         assert.match(rover.body.username, /^rover-[a-f0-9]{8}$/);
         assert.match(rover.body.password, /^[A-Za-z0-9_-]{12}$/);
         const list = await api.request('/api/member/rovers', { cookie }); assert.equal(list.body.users[0].password, undefined);
-        const bob = await api.request('/api/member/login', { method: 'POST', body: { username: 'bob', password: 'another-long-password' } });
+        const bob = await api.login('bob');
         const bobCsrf = (await api.request('/api/member/me', { cookie: bob.cookie })).body.csrf;
         assert.equal((await api.request('/api/member/rovers', { cookie: bob.cookie })).body.users.length, 0);
         assert.equal((await api.request('/api/member/rovers/' + rover.body.username, { cookie: bob.cookie, csrf: bobCsrf, method: 'PUT', body: { rotate: true } })).status, 404);
@@ -179,12 +192,12 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         await api.request('/api/members/alice', admin('PUT', { active: false }));
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
         assert.equal((await api.request('/api/public/stations', { cookie })).status, 401);
-        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).status, 401);
+        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { email: 'alice@example.com' } })).status, 200);
         await api.request('/api/members/alice', admin('PUT', { active: true }));
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401, 're-enabling cannot revive an old session');
         await api.request('/api/members/alice', admin('PUT', { password: 'new-password-for-alice' }));
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
-        const fresh = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'new-password-for-alice' } });
+        const fresh = await api.login();
         const freshCsrf = (await api.request('/api/member/me', { cookie: fresh.cookie })).body.csrf;
         await api.request('/api/member/logout', { cookie: fresh.cookie, csrf: freshCsrf, method: 'POST', body: {} });
         assert.equal((await api.request('/api/member/me', { cookie: fresh.cookie })).status, 401);
@@ -193,9 +206,9 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
 
 test('settings saves and disk reloads permanently invalidate member cookies across disable and re-enable', async () => {
     const api = fixture(), admin = (method, body) => ({ auth: true, method, body });
-    const login = async () => (await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).cookie;
+    const login = async () => (await api.login('alice')).cookie;
     try {
-        await api.request('/api/members', admin('POST', { username: 'alice', password: 'long-member-password' }));
+        await api.request('/api/members', admin('POST', { username: 'alice', email: 'alice@example.com' }));
         for (const method of ['settings', 'reload']) {
             // Test both a cookie used while disabled and one not used until after re-enable.
             const used = await login(), unused = await login();
@@ -238,7 +251,7 @@ test('native login submission cannot place named credentials in a GET URL', () =
 
 test('production watcher reloads disk edits and atomic replacements, invalidating cookies without an explicit reload', async () => {
     const api = fixture({ diskWatch: true });
-    const login = async () => (await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).cookie;
+    const login = async () => (await api.login('alice')).cookie;
     let writePath = api.diskFile;
     async function diskUpdate(config, atomic) {
         let unsubscribe;
@@ -251,7 +264,7 @@ test('production watcher reloads disk edits and atomic replacements, invalidatin
         await observed;
     }
     try {
-        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'long-member-password' } });
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', email: 'alice@example.com' } });
         for (const mode of [false, true, true, 'symlink']) {
             if (mode === 'symlink') {
                 writePath = api.diskFile + '.target';
@@ -261,7 +274,7 @@ test('production watcher reloads disk edits and atomic replacements, invalidatin
             const cookie = await login(), config = JSON.parse(JSON.stringify(api.config()));
             await diskUpdate({ ...config, members: config.members.map(m => ({ ...m, active: false })) }, atomic);
             assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
-            assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).status, 401);
+            assert.equal((await api.request('/api/member/login', { method: 'POST', body: { email: 'alice@example.com' } })).status, 200);
             await diskUpdate(config, atomic);
             assert.equal((await api.request('/api/member/me', { cookie })).status, 401, 're-enable cannot restore the old cookie');
         }
@@ -272,7 +285,7 @@ test('production watcher reloads disk edits and atomic replacements, invalidatin
         assert.equal(JSON.parse(fs.readFileSync(api.diskFile)).members[0].active, false);
         fs.writeFileSync(api.diskFile, '{');
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
-        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).status, 400);
+        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { email: 'alice@example.com' } })).status, 400);
         assert.equal(fs.readFileSync(api.diskFile, 'utf8'), '{', 'invalid config must not be replaced with defaults');
         fs.writeFileSync(api.diskFile, JSON.stringify(config));
         assert.equal((await api.request('/api/member/me', { cookie: await login() })).status, 200);
@@ -291,22 +304,22 @@ test('trusted proxy clients have independent login budgets and untrusted forward
         try {
             assert.equal(typeof api.proxyTrust(), trusted ? 'function' : 'boolean');
             if (!trusted) assert.equal(api.proxyTrust(), false, 'forwarded headers stay untrusted by default');
-            await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+            await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', email: 'alice@example.com' } });
             // Invalid passwords skip the KDF; unique account names isolate IP budgeting.
             for (let i = 0; i < 100; i++) {
                 const result = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.1', body: { username: 'unknown' + i } });
-                assert.equal(result.status, 401);
+                assert.equal(result.status, 200);
             }
-            const login = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.2', body: { username: 'alice', password: 'member-audit-password' } });
+            const login = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.2', body: { email: 'alice@example.com' } });
             assert.equal(login.status, 200, 'unset proxy trust must not block every member behind a shared peer');
             if (!trusted) {
                 // Hostile forwarding headers remain ignored without proxy trust.
-                const ordinary = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+                const ordinary = await api.login('alice');
                 assert.equal(ordinary.status, 200);
             }
             if (trusted) {
                 // A forged leftmost address cannot bypass the first untrusted hop.
-                const forged = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.99, 192.0.2.1', body: { username: 'alice', password: 'member-audit-password' } });
+                const forged = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.99, 192.0.2.1', body: { email: 'alice@example.com' } });
                 assert.equal(forged.status, 429);
             }
         } finally { await api.close(); }
@@ -323,16 +336,45 @@ test('ten thousand unknown usernames cannot deny a valid member login without pr
     delete process.env.NEARTRIP_TRUSTED_PROXIES;
     const api = fixture();
     try {
-        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', email: 'alice@example.com' } });
         for (let i = 0; i < 10000; i++) {
             const result = await api.request('/api/member/login', { method: 'POST', body: { username: 'unknown' + i } });
-            assert.equal(result.status, 401);
+            assert.equal(result.status, 200);
         }
-        const login = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        const login = await api.login('alice');
         assert.equal(login.status, 200);
     } finally {
         await api.close();
         if (saved === undefined) delete process.env.NEARTRIP_TRUSTED_PROXIES;
         else process.env.NEARTRIP_TRUSTED_PROXIES = saved;
     }
+});
+
+test('magic links require an invited active email, expire, and are single use', async () => {
+    const api = fixture(), now = Date.now;
+    try {
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', email: 'Alice@example.com' } });
+        assert.equal(api.config().members[0].email, 'alice@example.com');
+        const request = email => api.request('/api/member/login', { method: 'POST', body: { email } });
+        const verify = token => api.request('/api/member/verify', { method: 'POST', body: { token } });
+        const unknown = await request('stranger@example.com');
+        const invited = await request('ALICE@example.com');
+        assert.deepEqual(unknown.body, invited.body);
+        assert.equal(api.sent.length, 1);
+        await request('alice@example.com');
+        assert.equal(api.sent.length, 1, 'email cooldown');
+        const token = api.sent[0].token;
+        assert.equal((await verify(token)).status, 200);
+        assert.equal((await verify(token)).status, 401, 'no token replay');
+        await request('alice@example.com');
+        const expired = api.sent.at(-1).token;
+        Date.now = () => now() + 900001;
+        assert.equal((await verify(expired)).status, 401, '15 minute expiry');
+        Date.now = now;
+        await request('alice@example.com');
+        const revoked = api.sent.at(-1).token;
+        await api.request('/api/members/alice', { auth: true, method: 'PUT', body: { active: false } });
+        await api.request('/api/members/alice', { auth: true, method: 'PUT', body: { active: true } });
+        assert.equal((await verify(revoked)).status, 401, 'disable revokes pending link permanently');
+    } finally { Date.now = now; await api.close(); }
 });

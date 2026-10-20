@@ -9,6 +9,14 @@ services:
     environment:
       # Set to the Traefik container IP or a dedicated proxy-only subnet.
       NEARTRIP_TRUSTED_PROXIES: ${NEARTRIP_TRUSTED_PROXIES:-}
+      NEARTRIP_SECURE_COOKIES: ${NEARTRIP_SECURE_COOKIES:-true}
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SECURE: ${SMTP_SECURE:-true}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
     volumes:
       - config:/app/config
       - logs:/app/logs

@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="referrer" content="no-referrer">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Sign in · NearTRIP</title>
     <link rel="stylesheet" href="/login.css">
@@ -11,11 +12,9 @@
         <h1>NearTRIP</h1>
         <h2>Sign in</h2>
         <form id="loginForm" method="post" action="/login">
-            <label for="username">Username</label>
-            <input id="username" name="username" autocomplete="username" required maxlength="64">
-            <label for="password">Password</label>
-            <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
-            <button type="submit">Sign in</button>
+            <label for="email">Invited email address</label>
+            <input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
+            <button type="submit">Email me a sign-in link</button>
         </form>
         <p id="message" role="status"></p>
         <p class="help">Need an account? Contact your network administrator.</p>

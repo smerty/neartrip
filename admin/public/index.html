@@ -213,7 +213,7 @@
             <p id="memberMessage" role="status"></p><div id="memberList"></div>
             <form id="memberForm" class="console-card"><h3 id="memberTitle">Create member</h3><div class="row g-3">
             <div class="col-md-4"><label for="memberName">Username</label><input id="memberName" class="form-control" required maxlength="64" autocomplete="off"></div>
-            <div class="col-md-4"><label for="memberPassword">Dashboard password</label><input id="memberPassword" class="form-control" type="password" minlength="12" maxlength="256" autocomplete="new-password"><small>Minimum 12 characters. Leave blank when editing to keep it.</small></div>
+            <div class="col-md-4"><label for="memberEmail">Invited email address</label><input id="memberEmail" class="form-control" type="email" required maxlength="254" autocomplete="off"><small>Only enabled members receive magic sign-in links.</small></div>
             <div class="col-md-4"><label><input id="memberActive" type="checkbox" checked> Enabled</label></div></div>
             <button class="btn btn-primary mt-3">Save member</button><button id="memberCancel" type="button" class="btn btn-secondary mt-3">New member</button></form>
             <h2 class="mt-4">Rover users</h2>

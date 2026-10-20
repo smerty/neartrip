@@ -11,7 +11,8 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:admin": "node --test tests/*.cjs"
-  },  "repository": {
+  },
+  "repository": {
     "type": "git",
     "url": "git+https://github.com/smerty/neartrip.git"
   },
@@ -33,7 +34,8 @@
     "express": "^5.1.0",
     "express-basic-auth": "^1.2.1",
     "geolib": "^3.3.3",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "nodemailer": "^10.1.7"
   },
   "devDependencies": {
     "jest": "^29.7.0"

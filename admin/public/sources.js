@@ -3,6 +3,7 @@
     let sources = [];
     let editing = null;
     let loading = false;
+    let actionTargets = new Map();
     const el = id => document.getElementById(id);
     const message = (text, error = false) => {
         el('sourceMessage').textContent = text;
@@ -16,11 +17,12 @@
     }
     const json = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const endpoint = mount => '/api/sources/' + encodeURIComponent(mount);
-    function button(cell, label, action) {
+    function button(cell, label, action, identity) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'btn btn-sm btn-outline-secondary me-1';
         btn.textContent = label;
+        actionTargets.set(btn, identity);
         btn.addEventListener('click', async () => {
             btn.disabled = true;
             try { await action(); } catch (error) { message(error.message, true); }
@@ -51,8 +53,11 @@
         try {
             sources = await api('/api/sources');
             const body = el('sourcesTable').querySelector('tbody');
+            // Capture after fetching so focus moved into a form while awaiting data stays there.
+            const focusedAction = actionTargets.get(document.activeElement);
+            actionTargets = new Map();
             body.replaceChildren();
-            for (const source of sources) {
+            for (const [index, source] of sources.entries()) {
                 const row = document.createElement('tr');
                 const h = source.health;
                 const position = source.position;
@@ -100,13 +105,15 @@
                 admissionCell.appendChild(progress);
                 const actions = document.createElement('td');
                 actions.className = 'text-nowrap';
-                button(actions, 'Edit', () => edit(source));
-                button(actions, source.active ? 'Disable' : 'Enable', async () => {
+                const publisherButton = (label, action, handler) =>
+                    button(actions, label, handler, { mountPoint: source.mountPoint, action, index });
+                publisherButton('Edit', 'edit', () => edit(source));
+                publisherButton(source.active ? 'Disable' : 'Enable', 'toggle', async () => {
                     await api(endpoint(source.mountPoint), json('PUT', { active: !source.active }));
                     message('Publisher updated. The core reloads changes within a second.');
                     await load();
                 });
-                button(actions, 'Delete', async () => {
+                publisherButton('Delete', 'delete', async () => {
                     if (!confirm('Delete publisher ' + source.mountPoint + '? Its upload will be disconnected.')) return;
                     await api(endpoint(source.mountPoint), { method: 'DELETE' });
                     if (editing === source.mountPoint) el('sourceForm').hidden = true;
@@ -123,6 +130,15 @@
                 const row = document.createElement('tr');
                 row.appendChild(cell);
                 body.appendChild(row);
+            }
+            if (focusedAction) {
+                const targets = [...actionTargets];
+                const findAction = mount => targets.find(([, identity]) =>
+                    identity.mountPoint === mount && identity.action === focusedAction.action)?.[0];
+                // If deleted, continue at the next publisher, or the previous one at the end.
+                const fallbackMount = sources[Math.min(focusedAction.index, sources.length - 1)]?.mountPoint;
+                const target = findAction(focusedAction.mountPoint) || findAction(fallbackMount) || el('addSourceBtn');
+                target.focus({ preventScroll: true });
             }
         } catch (error) { message('Could not refresh publisher health: ' + error.message, true); }
         finally { loading = false; }

@@ -327,3 +327,97 @@ test('the publisher form and API accept sub-centimeter tolerances during unrelat
         assert.equal(api.request('put', '/api/sources/:mountPoint', { positionToleranceM: 0 }).code, 400);
     }
 });
+
+test('publisher refresh preserves keyboard action focus without stealing focus from forms', async () => {
+    let document;
+    class Element {
+        constructor() {
+            this.children = []; this.listeners = {}; this.style = {};
+            this.value = ''; this.hidden = false; this.disabled = false;
+        }
+        appendChild(child) { child.parentNode = this; this.children.push(child); }
+        replaceChildren() {
+            for (let node = document.activeElement; node; node = node.parentNode) {
+                if (node === this) { document.activeElement = document.body; break; }
+            }
+            this.children = [];
+        }
+        addEventListener(event, fn) { this.listeners[event] = fn; }
+        querySelector() { return body; }
+        focus(options) { document.activeElement = this; this.focusOptions = options; }
+        reset() {}
+    }
+    const elements = new Map(), body = new Element();
+    const element = id => {
+        if (!elements.has(id)) elements.set(id, new Element());
+        return elements.get(id);
+    };
+    document = {
+        body: new Element(), activeElement: null,
+        getElementById: element,
+        createElement() { return new Element(); },
+        addEventListener(_event, fn) { start = fn; },
+    };
+    const source = mountPoint => ({
+        ...publicSource({ ...base, mountPoint }),
+        position: null, health: { status: 'healthy', lastDataAt: null, bytesReceived: 0, subscribers: 0 },
+        onboarding: { status: 'ready' },
+    });
+    let records = [source('A'), source('B'), source('C')];
+    let start, refresh, pendingResponse;
+    const context = vm.createContext({
+        document, Date, confirm() { return true; },
+        setInterval(fn) { refresh = fn; },
+        async fetch() {
+            if (pendingResponse) await new Promise(resolve => { pendingResponse = resolve; });
+            return { ok: true, async json() { return records; } };
+        },
+    });
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '../admin/public/sources.js'), 'utf8'), context);
+    start();
+    await new Promise(resolve => setImmediate(resolve));
+    const action = (row, column) => body.children[row].children[7].children[column];
+    action(1, 1).focus();
+    await refresh();
+    assert.equal(document.activeElement, action(1, 1));
+    assert.equal(document.activeElement.focusOptions.preventScroll, true);
+
+    // Preserve semantic Toggle action when its label and row order change.
+    records = [source('C'), source('A'), { ...source('B'), active: false }];
+    await refresh();
+    assert.equal(document.activeElement, action(2, 1));
+    assert.equal(document.activeElement.textContent, 'Enable');
+
+    records = [source('C'), source('A')];
+    await refresh();
+    assert.equal(document.activeElement, action(1, 1), 'deleted final row falls back to previous publisher');
+    records = [source('C')];
+    action(0, 2).focus();
+    await refresh();
+    assert.equal(document.activeElement, action(0, 2));
+    records = [];
+    await refresh();
+    assert.equal(document.activeElement, element('addSourceBtn'));
+
+    records = [source('A'), source('B'), source('C')];
+    await refresh();
+    action(1, 0).focus();
+    records = [source('A'), source('C')];
+    await refresh();
+    assert.equal(document.activeElement, action(1, 0), 'deleted middle row continues at next publisher');
+
+    element('sourceForm').hidden = false;
+    element('sourceUsername').focus();
+    await refresh();
+    assert.equal(document.activeElement, element('sourceUsername'));
+
+    // Focus may move after the refresh starts but before its response arrives.
+    action(0, 0).focus();
+    pendingResponse = true;
+    const refreshing = refresh();
+    element('sourcePassword').focus();
+    pendingResponse();
+    pendingResponse = null;
+    await refreshing;
+    assert.equal(document.activeElement, element('sourcePassword'));
+});

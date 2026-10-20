@@ -481,3 +481,116 @@ async fn onboarding_holds_nearest_until_confirmed_and_requalifies_after_movement
     task.await.unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn length_framed_post_stops_at_body_boundary_and_releases_mountpoint() {
+    let config =
+        Config::parse(r#"{"sources":[{"mountPoint":"BASE","username":"b","password":"s"}]}"#)
+            .unwrap();
+    let (_cfg, configs) = watch::channel(config.clone());
+    let (stop, shutdown) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = std::env::temp_dir().join(format!("neartrip-post-boundary-{}", std::process::id()));
+    let hub = Arc::new(neartrip::caster::Hub::default());
+    let task = tokio::spawn(neartrip::server::serve_with_hub(
+        listener,
+        configs,
+        Arc::new(Registry::new(dir.join("sessions.json"))),
+        shutdown,
+        hub.clone(),
+    ));
+    let (mut source, response) = request(
+        addr,
+        "POST /BASE HTTP/1.1\r\nAuthorization: Basic Yjpz\r\nContent-Length: 6\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("200"));
+    let (mut rover, _) = request(addr, "GET /BASE HTTP/1.0\r\n\r\n").await;
+    source.write_all(b"AB").await.unwrap();
+    let mut prefix = [0; 2];
+    timeout(Duration::from_secs(2), rover.read_exact(&mut prefix))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&prefix, b"AB");
+    source
+        .write_all(b"CDEFGET / HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    // Publisher stays open; the declared body end alone must close subscribers.
+    let mut remaining = Vec::new();
+    timeout(Duration::from_secs(2), rover.read_to_end(&mut remaining))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        remaining, b"CDEF",
+        "trailing request bytes must not reach rovers"
+    );
+    let health = serde_json::to_value(hub.health(&config)).unwrap();
+    assert_eq!(health[0]["status"], "offline");
+    assert_eq!(health[0]["bytesReceived"], 6);
+
+    // Body bytes coalesced with headers must obey the same limit.
+    for (length, body) in [
+        (3, "ABCGET / HTTP/1.1\r\n\r\n"),
+        (0, "GET / HTTP/1.1\r\n\r\n"),
+    ] {
+        let (_source, response) = request(addr, &format!(
+            "POST /BASE HTTP/1.1\r\nAuthorization: Basic Yjpz\r\nContent-Length: {length}\r\n\r\n{body}"
+        )).await;
+        assert!(response.contains("200"));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let health = serde_json::to_value(hub.health(&config)).unwrap();
+                if health[0]["status"] == "offline" {
+                    assert_eq!(health[0]["bytesReceived"], length);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    for header in [
+        "Content-Length: -1",
+        "Content-Length: 3\r\nContent-Length: 4",
+    ] {
+        let (_, response) = request(
+            addr,
+            &format!("POST /BASE HTTP/1.1\r\nAuthorization: Basic Yjpz\r\n{header}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.contains("400"));
+        assert!(hub.subscribe("BASE").is_none());
+    }
+
+    let (mut source, response) = request(
+        addr,
+        "POST /BASE HTTP/1.1\r\nAuthorization: Basic Yjpz\r\nContent-Length: 6\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.contains("200"),
+        "completed uploads must release the mountpoint"
+    );
+    let (mut rover, _) = request(addr, "GET /BASE HTTP/1.0\r\n\r\n").await;
+    source.write_all(b"AB").await.unwrap();
+    source.shutdown().await.unwrap();
+    let mut body = Vec::new();
+    timeout(Duration::from_secs(2), rover.read_to_end(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(body, b"AB");
+    let health = serde_json::to_value(hub.health(&config)).unwrap();
+    assert!(health[0]["lastError"]
+        .as_str()
+        .unwrap()
+        .contains("before Content-Length"));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

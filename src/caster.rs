@@ -252,6 +252,51 @@ impl Drop for Publisher<'_> {
     }
 }
 
+/// Unframed legacy uploads run until disconnect; POST bodies may declare a boundary.
+struct UploadBody {
+    remaining: Option<u64>,
+}
+impl UploadBody {
+    fn for_request(method: &str, head: &str) -> Result<Self, ()> {
+        let mut remaining = None;
+        if method == "POST" {
+            for line in head.lines().skip(1) {
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        if name != name.trim() {
+                            return Err(());
+                        }
+                        let value = value.trim();
+                        if remaining.is_some()
+                            || value.is_empty()
+                            || !value.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            return Err(());
+                        }
+                        remaining = Some(value.parse::<u64>().map_err(|_| ())?);
+                    }
+                }
+            }
+        }
+        Ok(Self { remaining })
+    }
+
+    fn take<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        match self.remaining.as_mut() {
+            Some(remaining) => {
+                let count = (*remaining).min(bytes.len() as u64) as usize;
+                *remaining -= count as u64;
+                &bytes[..count]
+            }
+            None => bytes,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.remaining == Some(0)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn route(
     head: &str,
@@ -315,10 +360,13 @@ pub async fn route(
         // Version 2 chunk framing must never leak into correction payloads.
         if head.lines().skip(1).any(|l| {
             l.split_once(':')
-                .is_some_and(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("transfer-encoding"))
         }) {
             return Some(reject(write, "501 Not Implemented").await);
         }
+        let Ok(mut body) = UploadBody::for_request(method, head) else {
+            return Some(reject(write, "400 Bad Request").await);
+        };
         let tx = {
             let mut streams = hub.streams.lock().unwrap();
             if streams.get(mount).is_some_and(|s| s.tx.is_some()) {
@@ -360,9 +408,11 @@ pub async fn route(
                     b"HTTP/1.1 200 OK\r\n\r\n"
                 };
                 write.write_all(response).await.map_err(|e| e.to_string())?;
-                if !rest.is_empty() {
-                    hub.publish(source.unwrap(), rest);
+                let initial = body.take(rest);
+                if !initial.is_empty() {
+                    hub.publish(source.unwrap(), initial);
                 }
+                if body.complete() { return Err("source body complete".into()); }
                 let mut buf = [0u8; 4096];
                 let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 loop {
@@ -377,11 +427,15 @@ pub async fn route(
                             n.map_err(|_| "source idle timeout")?.map_err(|e| e.to_string())?,
                     };
                     if n == 0 {
-                        return Err("source disconnected".into());
+                        return Err(if body.remaining.is_some() {
+                            "source disconnected before Content-Length boundary"
+                        } else { "source disconnected" }.into());
                     }
                     deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                     registry.add_bytes(&live.id, 0, n as u64);
-                    hub.publish(source.unwrap(), &buf[..n]);
+                    let payload = body.take(&buf[..n]);
+                    if !payload.is_empty() { hub.publish(source.unwrap(), payload); }
+                    if body.complete() { return Err("source body complete".into()); }
                 }
             }.await;
         if let Err(err) = &result {
@@ -434,6 +488,47 @@ async fn reject(write: &mut OwnedWriteHalf, status: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_body_boundary_includes_initial_bytes_and_rejects_ambiguous_lengths() {
+        let mut body =
+            UploadBody::for_request("POST", "POST /BASE HTTP/1.1\r\nContent-Length: 6").unwrap();
+        assert_eq!(body.take(b"AB"), b"AB");
+        assert!(!body.complete());
+        assert_eq!(body.take(b"CDEFGET / HTTP/1.1\r\n\r\n"), b"CDEF");
+        assert!(body.complete());
+        assert!(body.take(b"trailing request").is_empty());
+        let mut body =
+            UploadBody::for_request("POST", "POST /BASE HTTP/1.1\r\ncontent-length: 2").unwrap();
+        assert_eq!(
+            body.take(b"ABTRAILING"),
+            b"AB",
+            "initial body bytes must also be bounded"
+        );
+        assert!(body.complete());
+        let body =
+            UploadBody::for_request("POST", "POST /BASE HTTP/1.1\r\nContent-Length: 0").unwrap();
+        assert!(body.complete());
+        for headers in [
+            "Content-Length: -1",
+            "Content-Length : 2",
+            " Content-Length: 2",
+            "Content-Length: +3",
+            "Content-Length:",
+            "Content-Length: 2, 2",
+            "Content-Length: 18446744073709551616",
+            "Content-Length: 2\r\nContent-Length: 2",
+            "Content-Length: 2\r\ncontent-length: 3",
+        ] {
+            assert!(
+                UploadBody::for_request("POST", &format!("POST /BASE HTTP/1.1\r\n{headers}"))
+                    .is_err()
+            );
+        }
+        let mut body = UploadBody::for_request("POST", "POST /BASE HTTP/1.1").unwrap();
+        assert_eq!(body.take(b"unframed"), b"unframed");
+        assert!(!body.complete());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn health_excludes_waiting_stale_disabled_and_offline_sources() {

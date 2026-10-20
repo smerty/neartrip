@@ -226,7 +226,12 @@ configured TCP port (default 2101), mountpoint `MY_BASE`, and the publisher's
 credentials. The hostname must point to the deployed server and its TCP port
 must be reachable. NTRIP v1 `SOURCE` uses the publisher password; NTRIP v2
 `POST` uses Basic authentication. Chunked uploads are currently rejected (501);
-use an unchunked upload mode. The listener is plain TCP; transport encryption
+use an unchunked upload mode. A POST with `Content-Length` ends at that body
+boundary and releases its mountpoint; bytes after the body are discarded and
+the connection is closed rather than reused for another request. Invalid or
+duplicate length headers are rejected before accepting an upload. POST without
+a length and legacy SOURCE uploads continue until disconnection or idle timeout.
+The listener is plain TCP; transport encryption
 requires compatible TLS termination or a trusted network.
 
 Rovers use their normal rover credentials. Request `MY_BASE` for a fixed base

@@ -61,6 +61,7 @@ function adminApi(coreRecords) {
     const context = vm.createContext({
         __dirname: path.resolve(__dirname, '../admin'),
         module: { exports: {} },
+        process: { env: {} },
         setInterval(fn) { purge = fn; return { unref() {} }; }, clearInterval() {},
         require(name) {
             if (name === 'express') return express;

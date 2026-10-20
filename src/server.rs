@@ -80,6 +80,7 @@ pub async fn serve_with_hub(
     mut shutdown: watch::Receiver<bool>,
     hub: Arc<crate::caster::Hub>,
 ) {
+    let admission = crate::admission::Admission::default();
     let mut clients = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -93,18 +94,26 @@ pub async fn serve_with_hub(
                 match accepted {
                     Ok((mut socket, peer)) => {
                         if !registry.security.admit(peer.ip(), &configs.borrow().security, crate::caster::now_ms()) {
-                            clients.spawn(async move {
-                                let _ = tokio::time::timeout(Duration::from_secs(1),
-                                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")).await;
-                            });
+                            let _ = tokio::time::timeout(Duration::from_millis(10),
+                                socket.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")).await;
+                            // Rejected peers never allocate tasks, records, or log files.
+                            drop(socket);
                             continue;
                         }
+                        let limits = configs.borrow().connection_limits.clone();
+                        let Some(mut lease) = admission.acquire(peer.ip(), &limits) else {
+                            drop(socket);
+                            continue;
+                        };
                         let hub = hub.clone();
                         let configs = configs.clone();
                         let registry = Arc::clone(&registry);
                         let mut shutdown = shutdown.clone();
                         clients.spawn(async move {
                             let live = registry.open(peer).await;
+                            let mut cleanup = SessionCleanup::new(&registry, &live.id);
+                            let deadline = Instant::now() + Duration::from_secs(limits.handshake_timeout_seconds);
+                            let mut authenticated = false;
                             let policy_configs = configs.clone();
                             let session = handle_client(socket, peer, configs, &registry, &live, &hub);
                             tokio::pin!(session);
@@ -112,7 +121,17 @@ pub async fn serve_with_hub(
                             let reason = loop {
                                 tokio::select! {
                                     _ = shutdown.changed() => break "core shutdown".to_string(),
+                                    _ = tokio::time::sleep_until(deadline), if !authenticated => {
+                                        if registry.accepted(&live.id) {
+                                            authenticated = true;
+                                            lease.authenticated();
+                                        } else { break "handshake timeout".to_string(); }
+                                    }
                                     _ = policy_tick.tick() => {
+                                        if !authenticated && registry.accepted(&live.id) {
+                                            authenticated = true;
+                                            lease.authenticated();
+                                        }
                                         if registry.rover_revoked(&live.id, &policy_configs.borrow()) {
                                             break "rover access revoked".to_string();
                                         }
@@ -123,7 +142,7 @@ pub async fn serve_with_hub(
                                     reason = &mut session => break reason,
                                 }
                             };
-                            registry.close_with_reason(&live.id, &reason);
+                            cleanup.finish(&reason);
                         });
                     }
                     Err(err) => {
@@ -135,6 +154,34 @@ pub async fn serve_with_hub(
         }
     }
     while clients.join_next().await.is_some() {}
+}
+
+// Runs during unwinding and cancellation as well as normal disconnects.
+struct SessionCleanup<'a> {
+    registry: &'a Registry,
+    id: &'a str,
+    finished: bool,
+}
+impl<'a> SessionCleanup<'a> {
+    fn new(registry: &'a Registry, id: &'a str) -> Self {
+        Self {
+            registry,
+            id,
+            finished: false,
+        }
+    }
+    fn finish(&mut self, reason: &str) {
+        self.registry.close_with_reason(self.id, reason);
+        self.finished = true;
+    }
+}
+impl Drop for SessionCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.registry
+                .close_with_reason(self.id, "session cancelled or panicked");
+        }
+    }
 }
 
 async fn handle_client(
@@ -189,6 +236,9 @@ async fn session(
         registry.add_bytes(&live.id, 0, n as u64);
         incoming.extend_from_slice(&tmp[..n]);
         if let Some(split_at) = find_subsequence(&incoming, b"\r\n\r\n") {
+            if split_at + 4 > HANDSHAKE_LIMIT {
+                return Err("handshake too large".into());
+            }
             let head = String::from_utf8_lossy(&incoming[..split_at]).into_owned();
             let rest = incoming[split_at + 4..].to_vec();
             if let Some(result) = crate::caster::route(
@@ -358,7 +408,9 @@ async fn stream(
     live: &crate::registry::LiveSession,
     hub: &crate::caster::Hub,
 ) -> Result<(), String> {
-    let mut line_buf = pending;
+    let mut line_buf = Vec::new();
+    let mut discarding_line = false;
+    append_nmea(&mut line_buf, &mut discarding_line, &pending);
     // Inline arrays live in every suspended rover task. Keep them bounded;
     // TCP reads may split any sentence or correction burst across iterations.
     let mut tmp = [0u8; 1024];
@@ -479,7 +531,7 @@ async fn stream(
                 let n = n?;
                 client_deadline = tokio::time::Instant::now() + READ_IDLE;
                 registry.add_bytes(&live.id, 0, n as u64);
-                line_buf.extend_from_slice(&tmp[..n]);
+                append_nmea(&mut line_buf, &mut discarding_line, &tmp[..n]);
             }
             Ok::<(), String>(())
         })
@@ -522,6 +574,33 @@ async fn recover_upstream(
     }
 }
 
+// Discard an oversized line through its newline, including across TCP reads.
+// Never parse its trailing fragment as a new NMEA sentence.
+fn append_nmea(buffer: &mut Vec<u8>, discarding: &mut bool, data: &[u8]) {
+    let mut start = buffer
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    for &byte in data {
+        if *discarding {
+            if byte == b'\n' {
+                *discarding = false;
+            }
+            continue;
+        }
+        if buffer.len() - start >= LINE_LIMIT {
+            buffer.truncate(start);
+            *discarding = byte != b'\n';
+            continue;
+        }
+        buffer.push(byte);
+        if byte == b'\n' {
+            start = buffer.len();
+        }
+    }
+}
+
 async fn drain_lines(
     line_buf: &mut Vec<u8>,
     configs: &watch::Receiver<Config>,
@@ -534,6 +613,10 @@ async fn drain_lines(
     latest_gga: &mut Option<crate::nmea::Gga>,
 ) {
     while let Some(split) = line_buf.iter().position(|byte| *byte == b'\n') {
+        if split + 1 > LINE_LIMIT {
+            line_buf.drain(..=split);
+            continue;
+        }
         let raw: Vec<u8> = line_buf.drain(..=split).collect();
         let line = String::from_utf8_lossy(&raw)
             .trim()
@@ -554,9 +637,6 @@ async fn drain_lines(
             )
             .await;
         }
-    }
-    if line_buf.len() > LINE_LIMIT {
-        line_buf.clear();
     }
 }
 
@@ -827,6 +907,58 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_fragmented_lines_are_discarded_until_newline() {
+        let mut buffer = Vec::new();
+        let mut discarding = false;
+        append_nmea(&mut buffer, &mut discarding, &vec![b'x'; 2000]);
+        assert!(discarding);
+        assert!(buffer.is_empty());
+        append_nmea(&mut buffer, &mut discarding, b"$GPGGA*00\nvalid\n");
+        assert!(!discarding);
+        assert_eq!(buffer, b"valid\n");
+    }
+
+    #[tokio::test]
+    async fn cleanup_guard_releases_authenticated_accounting_after_panic_and_abort() {
+        for panic in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "neartrip-cleanup-{}-{panic}.json",
+                std::process::id()
+            ));
+            let registry = Arc::new(Registry::new(&path));
+            let worker_registry = registry.clone();
+            let (ready, wait_ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let live = worker_registry
+                    .open("192.0.2.1:1234".parse().unwrap())
+                    .await;
+                let _cleanup = SessionCleanup::new(&worker_registry, &live.id);
+                worker_registry.authenticated(&live.id);
+                ready.send(()).unwrap();
+                if panic {
+                    panic!("injected session panic");
+                }
+                std::future::pending::<()>().await;
+            });
+            wait_ready.await.unwrap();
+            if !panic {
+                task.abort();
+            }
+            assert!(task.await.is_err());
+            registry.flush();
+            let rows: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(rows[0]["active"], false);
+            assert_eq!(rows[0]["disconnectReason"], "session cancelled or panicked");
+            let activity = registry
+                .security
+                .snapshot(&crate::security::Policy::default(), crate::caster::now_ms());
+            assert_eq!(activity[0].active_authenticated, 0);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     #[test]
     fn owned_account_authentication_handles_many_members_and_disabled_owners() {
         let members: Vec<_> = (0..1000)

@@ -15,14 +15,13 @@ pub struct Gga {
 /// Parse one NMEA line. `None` when it is not a valid GGA sentence.
 pub fn parse_gga(line: &str) -> Option<Gga> {
     let line = line.trim().trim_end_matches('\0');
-    if line.is_empty() {
+    if line.is_empty() || line.len() > 1024 || !line.is_ascii() {
         return None;
     }
     let (body, given) = line.split_once('*')?;
-    if given.len() < 2 {
+    if given.len() != 2 || !given.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let given = &given[..2];
     let mut checksum = 0u8;
     for byte in body.as_bytes().iter().skip(1) {
         checksum ^= byte;
@@ -93,6 +92,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_checksums_and_oversized_sentences_never_panic() {
+        for line in [
+            "$GPGGA*aé",
+            "$GPGGA*é",
+            "$GPGGA*",
+            "$GPGGA*0",
+            "$GPGGA*ZZ",
+            "$GPGGA*000",
+        ] {
+            assert_eq!(parse_gga(line), None, "{line}");
+        }
+        let huge = with_checksum(&format!("$GPGGA,{}", "1".repeat(2048)));
+        assert!(parse_gga(&huge).is_none());
+    }
+
+    #[test]
     fn parses_the_sample_gpgga_sentence() {
         let sentence = "$GPGGA,123519,3723.2475,N,12158.3416,W,1,07,1.0,9.0,M,-34.2,M,,*74";
         let parsed = parse_gga(sentence).unwrap();
@@ -108,12 +123,17 @@ mod tests {
         let sentence = with_checksum(body);
         assert!(parse_gga(&sentence).is_some());
         assert!(parse_gga("$GPGSA,A,3,,,,,,,,,,,,,1.0,1.0,1.0*33").is_none());
-        assert!(parse_gga("$GPRMC,123519,A,3723.2475,N,12158.3416,W,0.1,309.62,120598,*10").is_none());
+        assert!(
+            parse_gga("$GPRMC,123519,A,3723.2475,N,12158.3416,W,0.1,309.62,120598,*10").is_none()
+        );
     }
 
     #[test]
     fn rejects_a_bad_checksum_and_missing_coordinates() {
-        assert!(parse_gga("$GPGGA,123519,3723.2475,N,12158.3416,W,1,07,1.0,9.0,M,-34.2,M,,*00").is_none());
+        assert!(
+            parse_gga("$GPGGA,123519,3723.2475,N,12158.3416,W,1,07,1.0,9.0,M,-34.2,M,,*00")
+                .is_none()
+        );
         let missing = with_checksum("$GPGGA,123519,,N,,W,1,07,1.0,9.0,M,-34.2,M,,");
         assert!(parse_gga(&missing).is_none());
     }

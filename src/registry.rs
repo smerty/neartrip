@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,10 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 
+const MAX_RECORDS: usize = 16384;
+const MAX_LOG_BYTES: usize = 1024 * 1024;
+// Also bound detached writers draining queues after rapid authenticated reconnects.
+static NMEA_WRITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8192);
 const HISTORY_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -69,6 +73,15 @@ struct SessionTable {
 
 impl SessionTable {
     fn push(&mut self, record: SessionRecord) {
+        // Socket admission bounds active records. Evict closed history at capacity,
+        // including during bursts between periodic snapshots.
+        if self.records.len() >= MAX_RECORDS {
+            if let Some(index) = self.records.iter().position(|s| !s.active) {
+                let removed = self.records.remove(index);
+                remove_nmea_log(&removed);
+                self.reindex();
+            }
+        }
         self.by_id.insert(record.id.clone(), self.records.len());
         self.records.push(record);
     }
@@ -80,23 +93,42 @@ impl SessionTable {
 
     fn prune(&mut self, now: u64) {
         let previous_len = self.records.len();
-        self.records
-            .retain(|session| match session.disconnected_unix {
-                Some(then) => now.saturating_sub(then) < HISTORY_SECS,
-                None => true,
-            });
-        if self.records.len() != previous_len {
-            self.by_id.clear();
-            for (index, session) in self.records.iter().enumerate() {
-                self.by_id.insert(session.id.clone(), index);
+        self.records.retain(|session| {
+            let retain = session
+                .disconnected_unix
+                .map(|then| now.saturating_sub(then) < HISTORY_SECS)
+                .unwrap_or(true);
+            if !retain {
+                remove_nmea_log(session);
             }
+            retain
+        });
+        if self.records.len() != previous_len {
+            self.reindex();
         }
+    }
+
+    fn reindex(&mut self) {
+        self.by_id.clear();
+        for (index, session) in self.records.iter().enumerate() {
+            self.by_id.insert(session.id.clone(), index);
+        }
+    }
+}
+
+// Never trust a pathname loaded from a historical JSON file.
+fn remove_nmea_log(record: &SessionRecord) {
+    if record.id.len() == 32
+        && record.id.bytes().all(|b| b.is_ascii_hexdigit())
+        && record.nmea_log_file == format!("logs/connections/{}.nmea.log", record.id)
+    {
+        let _ = fs::remove_file(&record.nmea_log_file);
     }
 }
 
 pub struct LiveSession {
     pub(crate) id: String,
-    nmea: mpsc::Sender<String>,
+    nmea: OnceLock<mpsc::Sender<String>>,
 }
 
 impl Registry {
@@ -185,31 +217,6 @@ impl Registry {
 
     pub async fn open(&self, peer: SocketAddr) -> LiveSession {
         let id = session_id();
-        // This relative path is what the admin UI opens. The process working
-        // directory is the application root, so the write lands in the same place.
-        let nmea_log_file = format!("logs/connections/{id}.nmea.log");
-        let log_path = nmea_log_file.clone();
-        let (tx, mut rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            let _ = tokio::fs::create_dir_all("logs/connections").await;
-            let mut file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await
-            {
-                Ok(file) => file,
-                Err(err) => {
-                    tracing::warn!(%err, path = %log_path, "nmea log unavailable");
-                    return;
-                }
-            };
-            while let Some(line) = rx.recv().await {
-                if file.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
         let (now, _) = now_unix();
         self.with_mut(|sessions| {
             sessions.push(SessionRecord {
@@ -226,7 +233,7 @@ impl Registry {
                 current_station: None,
                 bytes_sent: 0,
                 bytes_received: 0,
-                nmea_log_file,
+                nmea_log_file: String::new(),
                 status: "tcp_connected".into(),
                 upstream_status: "disconnected".into(),
                 read_idle_timeout_secs: 120,
@@ -235,7 +242,10 @@ impl Registry {
             });
         });
         self.changed.notify_one();
-        LiveSession { id, nmea: tx }
+        LiveSession {
+            id,
+            nmea: OnceLock::new(),
+        }
     }
 
     pub fn publisher(&self, id: &str) {
@@ -299,11 +309,61 @@ impl Registry {
     }
 
     pub fn note_nmea(&self, session: &LiveSession, sentence: &str) {
-        let _ = session.nmea.try_send(format!("{sentence}\n"));
+        if sentence.len() > 1024 {
+            return;
+        }
+        // No per-socket log task or file until an authenticated rover emits NMEA.
+        let sender = session.nmea.get_or_init(|| {
+            let (tx, mut rx) = mpsc::channel::<String>(64);
+            let Ok(permit) = NMEA_WRITERS.try_acquire() else {
+                return tx;
+            };
+            let log_path = format!("logs/connections/{}.nmea.log", session.id);
+            self.with_mut(|sessions| {
+                if let Some(record) = sessions.get_mut(&session.id) {
+                    record.nmea_log_file = log_path.clone();
+                }
+            });
+            tokio::spawn(async move {
+                let _permit = permit;
+                let mut options = OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                options.mode(0o600);
+                let mut file = match options.open(&log_path).await {
+                    Ok(file) => file,
+                    Err(err) => {
+                        tracing::warn!(%err, "nmea log unavailable");
+                        return;
+                    }
+                };
+                let mut written = 0;
+                while let Some(line) = rx.recv().await {
+                    if written + line.len() > MAX_LOG_BYTES {
+                        break;
+                    }
+                    if file.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    written += line.len();
+                }
+                let _ = file.flush().await;
+            });
+            tx
+        });
+        let _ = sender.try_send(format!("{sentence}\n"));
     }
 
     pub fn authenticated(&self, id: &str) {
         self.authenticated_as(id, None);
+    }
+
+    pub fn accepted(&self, id: &str) -> bool {
+        self.with_mut(|sessions| {
+            sessions
+                .get_mut(id)
+                .is_some_and(|session| session.authenticated || session.role == "publisher")
+        })
     }
 
     pub fn rover_revoked(&self, id: &str, config: &crate::config::Config) -> bool {
@@ -395,12 +455,16 @@ impl Registry {
         self.stats.close(id, crate::caster::now_ms());
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
+                if !session.active {
+                    return;
+                }
                 if session.active && (session.authenticated || session.role == "publisher") {
                     if let Ok(ip) = session.client_ip.parse() {
                         self.security.closed(ip);
                     }
                 }
                 session.active = false;
+                session.credential = None;
                 session.status = "disconnected".into();
                 session.upstream_status = "disconnected".into();
                 session.disconnect_reason = Some(reason.into());
@@ -578,6 +642,59 @@ mod tests {
             disconnected_unix: disconnected,
             ..SessionRecord::default()
         }
+    }
+
+    #[test]
+    fn connection_churn_caps_history_without_evicting_active_sessions() {
+        let mut table = SessionTable::default();
+        table.push(record("active", None));
+        for i in 0..MAX_RECORDS + 100 {
+            table.push(record(&format!("closed{i}"), Some(1)));
+        }
+        assert_eq!(table.records.len(), MAX_RECORDS);
+        assert!(table.get_mut("active").unwrap().active);
+        assert!(table.get_mut("closed0").is_none());
+        assert!(table
+            .get_mut(&format!("closed{}", MAX_RECORDS + 99))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn nmea_log_size_and_expiration_are_bounded() {
+        let path =
+            std::env::temp_dir().join(format!("neartrip-log-limit-{}.json", std::process::id()));
+        let registry = Registry::new(&path);
+        let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+        registry.authenticated(&session.id);
+        registry.note_nmea(&session, "first");
+        let sender = session.nmea.get().unwrap();
+        for _ in 0..1100 {
+            if sender.send("x".repeat(1023) + "\n").await.is_err() {
+                break;
+            }
+        }
+        let log = format!("logs/connections/{}.nmea.log", session.id);
+        let size = std::fs::metadata(&log).unwrap().len();
+        assert!(size <= MAX_LOG_BYTES as u64);
+        assert!(size > (MAX_LOG_BYTES - 1024) as u64);
+        registry.close(&session.id);
+        registry.with_mut(|sessions| {
+            sessions.get_mut(&session.id).unwrap().disconnected_unix = Some(0)
+        });
+        registry.flush();
+        assert!(!Path::new(&log).exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connections_do_not_create_nmea_files() {
+        let path =
+            std::env::temp_dir().join(format!("neartrip-no-log-{}.json", std::process::id()));
+        let registry = Registry::new(&path);
+        let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+        assert!(!Path::new(&format!("logs/connections/{}.nmea.log", session.id)).exists());
+        assert!(session.nmea.get().is_none());
+        registry.close(&session.id);
     }
 
     #[test]

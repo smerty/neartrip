@@ -103,7 +103,7 @@ impl Stats {
         }
     }
     pub fn close(&self, id: &str, now: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tracked) = inner.sessions.remove(id) {
             let map = if tracked.publisher {
                 &mut inner.bases

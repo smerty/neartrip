@@ -1,6 +1,7 @@
 //! NTRIP session core. One task per rover, one upstream caster socket, GGA forwarded.
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod caster;
 pub mod config;
 pub mod geo;

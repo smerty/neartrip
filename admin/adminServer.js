@@ -46,6 +46,27 @@ function initAdminServer(options = {}) {
     } = options;
 
     const app = express();
+    // Addresses/CIDRs only. Never trust arbitrary forwarded headers or hop counts.
+    const trustedProxies = (process.env.NEARTRIP_TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (trustedProxies.length) {
+        const net = require('net');
+        const proxies = new net.BlockList();
+        for (const entry of trustedProxies) {
+            const [address, bits, extra] = entry.split('/');
+            const version = net.isIP(address);
+            if (!version || extra !== undefined || (bits !== undefined &&
+                (!/^\d+$/.test(bits) || Number(bits) > (version === 4 ? 32 : 128)))) {
+                throw new Error('NEARTRIP_TRUSTED_PROXIES must contain proxy IP addresses or CIDRs');
+            }
+            if (bits === undefined) proxies.addAddress(address, version === 4 ? 'ipv4' : 'ipv6');
+            else proxies.addSubnet(address, Number(bits), version === 4 ? 'ipv4' : 'ipv6');
+        }
+        app.set('trust proxy', address => {
+            // Canonicalize mapped IPv4 without enabling Express's subnet matcher.
+            const ip = require('../utils/management').normalizeIp(address);
+            return proxies.check(ip, net.isIP(ip) === 4 ? 'ipv4' : 'ipv6');
+        });
+    }
     const configWatcher = configManager.watchConfig?.();
 
     // Enable logging
@@ -57,7 +78,7 @@ function initAdminServer(options = {}) {
     // Enable CORS
     app.use(cors());
 
-    const memberAccess = setupMembers(app, configManager, saveConfig, { username, password });
+    const memberAccess = setupMembers(app, configManager, saveConfig, { username, password, clientIpLimits: trustedProxies.length > 0 });
     app.get(['/', '/rovers', '/api/public/stations', '/index.html', '/rovers.html'], memberAccess.guard);
     app.get('/rovers', (_req, res) => res.sendFile(path.join(__dirname, '..', 'web/public/rovers.html')));
     // Station metadata is available only to authenticated members or admins.

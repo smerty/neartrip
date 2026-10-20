@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const path = require('path');
+const { LoginLimiter } = require('./login-limiter');
 const { promisify } = require('util');
 const scrypt = promisify(crypto.scrypt);
 const nameOK = s => typeof s === 'string' && /^[A-Za-z0-9_.@-]{1,64}$/.test(s) && !['.', '..'].includes(s);
@@ -25,7 +26,7 @@ function validateMembers(c) {
     return null;
 }
 function setupMembers(app, manager, save, admin) {
-    const sessions = new Map(), attempts = new Map();
+    const sessions = new Map(), limiter = new LoginLimiter();
     const invalidate = config => {
         for (const [token, session] of sessions) {
             if (!(config.members || []).some(m => m.username === session.username && m.active && m.passwordHash === session.version)) sessions.delete(token);
@@ -75,13 +76,17 @@ function setupMembers(app, manager, save, admin) {
     });
     app.post('/api/member/login', async (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
-        // Fixed-window limiter keyed by TCP peer, bounded against address churn.
-        const ip = req.socket.remoteAddress, now = Date.now();
-        for (const [key, value] of attempts) if (value.until <= now) attempts.delete(key);
-        if (!attempts.has(ip) && attempts.size >= 10000) return res.status(429).json({ error: 'Try again later' });
-        const attempt = attempts.get(ip) || { count: 0, until: now + 300000 };
-        attempts.set(ip, attempt);
-        if (++attempt.count > 20) return res.status(429).json({ error: 'Too many login attempts. Try again in five minutes.' });
+        const now = Date.now();
+        // req.ip honors forwarding headers only from explicitly trusted proxies.
+        const username = nameOK(req.body?.username) ? req.body.username : '<invalid>';
+        // Without configured proxy trust the peer may represent every member.
+        // Keep account backoff/concurrency protection, but never hard-block that peer.
+        const attempt = limiter.begin(req.ip, username, { limitIp: admin.clientIpLimits === true });
+        if (!attempt.finish) {
+            res.setHeader('Retry-After', String(attempt.retryAfter));
+            return res.status(429).json({ error: 'Too many login attempts. Try again shortly.' });
+        }
+        let success = false;
         try {
             const m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active);
             // Also run the KDF for unknown accounts.
@@ -94,8 +99,10 @@ function setupMembers(app, manager, save, admin) {
             const token = crypto.randomBytes(32).toString('hex');
             sessions.set(token, { username: m.username, version: m.passwordHash, csrf: crypto.randomBytes(32).toString('hex'), until: now + 8 * 3600000 });
             res.setHeader('Set-Cookie', 'neartrip_session=' + token + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800' + (req.secure || process.env.NEARTRIP_SECURE_COOKIES === 'true' ? '; Secure' : ''));
+            success = true;
             res.json(safe(m));
         } catch { res.status(400).json({ error: 'Invalid login' }); }
+        finally { attempt.finish(success); }
     });
     app.use('/api/member', memberGuard);
     app.get('/api/member/me', (req, res) => res.json({ ...safe(req.memberSession.member), csrf: req.memberSession.csrf }));

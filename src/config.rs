@@ -9,6 +9,8 @@ use tokio::sync::watch;
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     #[serde(default)]
+    pub connection_limits: crate::admission::Limits,
+    #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub password: String,
@@ -133,6 +135,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), String> {
         self.security.validate()?;
+        self.connection_limits.validate()?;
         let mut member_names = std::collections::HashSet::new();
         for member in &self.members {
             if member.username.is_empty() || !member_names.insert(&member.username) {
@@ -238,6 +241,23 @@ pub fn publish_reload(tx: &watch::Sender<Config>, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_limits_have_safe_defaults_and_reject_invalid_values() {
+        assert_eq!(
+            Config::parse("{}").unwrap().connection_limits,
+            crate::admission::Limits::default()
+        );
+        for value in [
+            r#"{"maxConnections":0}"#,
+            r#"{"maxPendingHandshakes":4097}"#,
+            r#"{"maxPendingPerIp":0}"#,
+            r#"{"handshakeTimeoutSeconds":61}"#,
+            r#"{"maxConnections":1,"maxPendingHandshakes":2}"#,
+        ] {
+            assert!(Config::parse(&format!(r#"{{"connectionLimits":{value}}}"#)).is_err());
+        }
+    }
 
     #[test]
     fn parses_sample_shape_and_defaults_active() {

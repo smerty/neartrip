@@ -22,6 +22,12 @@ const READ_IDLE: Duration = Duration::from_secs(120);
 const LINE_LIMIT: usize = 1024;
 const HANDSHAKE_LIMIT: usize = 8192;
 
+#[derive(Debug)]
+enum UpstreamReadError {
+    Io(std::io::Error),
+    Lagged(u64),
+}
+
 struct Upstream {
     read: Option<OwnedReadHalf>,
     write: Option<OwnedWriteHalf>,
@@ -390,7 +396,12 @@ async fn stream(
                                 last_fail = None;
                             }
                         }
-                        Err(err) => {
+                        Err(UpstreamReadError::Lagged(skipped)) => {
+                            let reason = format!("slow rover: direct source queue lagged by {skipped} packets");
+                            registry.upstream(&live.id, "error", Some(&reason));
+                            return Err(reason);
+                        }
+                        Err(UpstreamReadError::Io(err)) => {
                             registry.upstream(&live.id, "error", Some(&err.to_string()));
                             if let Some(link) = upstream.take() {
                                 tracing::warn!(id = %live.id, mount = %link.mount, error = %err,
@@ -683,18 +694,25 @@ fn flush_gga(link: &mut Upstream) -> std::io::Result<()> {
     }
 }
 
-async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::io::Result<usize> {
+async fn read_upstream(
+    upstream: &mut Option<Upstream>,
+    buf: &mut [u8],
+) -> Result<usize, UpstreamReadError> {
     match upstream.as_mut() {
         Some(link) => {
             if let Some(receiver) = link.direct.as_mut() {
-                let data = receiver.recv().await.map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())
-                })?;
+                let data = match receiver.recv().await {
+                    Ok(data) => data,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(0),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        return Err(UpstreamReadError::Lagged(skipped))
+                    }
+                };
                 if data.len() > buf.len() {
-                    return Err(std::io::Error::new(
+                    return Err(UpstreamReadError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "source chunk too large",
-                    ));
+                    )));
                 }
                 buf[..data.len()].copy_from_slice(&data);
                 link.last_data = Instant::now();
@@ -731,6 +749,7 @@ async fn read_upstream(upstream: &mut Option<Upstream>, buf: &mut [u8]) -> std::
                     "caster idle",
                 )),
             }
+            .map_err(UpstreamReadError::Io)
         }
         None => std::future::pending().await,
     }
@@ -754,6 +773,40 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_link(receiver: tokio::sync::broadcast::Receiver<Vec<u8>>) -> Option<Upstream> {
+        Some(Upstream {
+            read: None,
+            write: None,
+            direct: Some(receiver),
+            mount: "BASE".into(),
+            last_data: Instant::now(),
+            connected_at: Instant::now(),
+            session_id: "test".into(),
+            bytes_received: 0,
+            gga_pending: Vec::new(),
+            gga_latest: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn direct_queue_lag_is_distinct_from_recoverable_publisher_closure() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        let mut link = direct_link(receiver);
+        for byte in 0..3 {
+            sender.send(vec![byte]).unwrap();
+        }
+        let mut buffer = [0; 4096];
+        assert!(matches!(
+            read_upstream(&mut link, &mut buffer).await,
+            Err(UpstreamReadError::Lagged(1))
+        ));
+        // Closure follows the existing EOF/failover path rather than the lag path.
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        let mut link = direct_link(receiver);
+        drop(sender);
+        assert_eq!(read_upstream(&mut link, &mut buffer).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn retained_upstream_write_failure_clears_switch_backoff() {

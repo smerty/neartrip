@@ -431,9 +431,16 @@ function saveConfig(config) {
     const configPath = fs.realpathSync(configManager.CONFIG_FILE_PATH);
     const error = validateSources(config);
     if (error) throw new Error(error);
-    const temp = configPath + '.tmp';
-    fs.writeFileSync(temp, JSON.stringify(config, null, 4));
-    fs.renameSync(temp, configPath);
+    const mode = fs.statSync(configPath).mode & 0o777;
+    // A private, unique directory also avoids following a leftover temp symlink.
+    const tempDir = fs.mkdtempSync(path.join(path.dirname(configPath), '.neartrip-config-'));
+    const temp = path.join(tempDir, 'config.json');
+    try {
+        fs.writeFileSync(temp, JSON.stringify(config, null, 4), { flag: 'wx', mode });
+        fs.renameSync(temp, configPath);
+    } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
     configManager.reloadConfig();
     logger.info('Configuration saved successfully');
 }

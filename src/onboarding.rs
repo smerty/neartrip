@@ -37,6 +37,7 @@ impl Qualification {
         updated: bool,
         interrupted: bool,
     ) {
+        let observed_at = Instant::now();
         let next = position
             .map(|p| Anchor {
                 latitude: p.latitude,
@@ -71,12 +72,12 @@ impl Qualification {
         });
         if self.anchor.is_none() || interrupted || moved {
             self.anchor = Some(next);
-            self.since = Some(Instant::now());
+            self.since = Some(observed_at);
             self.last_position = None;
             self.moved = moved;
         }
         if updated {
-            self.last_position = Some(Instant::now());
+            self.last_position = Some(observed_at);
         }
     }
 
@@ -160,6 +161,26 @@ mod tests {
             message_type: 1005,
         }
     }
+    #[tokio::test]
+    async fn movement_report_keeps_attention_reason_with_a_live_clock() {
+        let source = source();
+        let mut q = Qualification::default();
+        let mut p = position();
+        q.observe(&source, Some(&p), true, false);
+        p.longitude += 0.001;
+        q.observe(&source, Some(&p), true, false);
+        assert_eq!(
+            q.since, q.last_position,
+            "one observation must use a single timestamp"
+        );
+        let view = q.view(&source, true, true, true);
+        assert_eq!(view.status, "needs_attention");
+        assert!(view.reason.unwrap().contains("changed"));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        q.observe(&source, Some(&p), true, false);
+        assert_eq!(q.view(&source, true, true, true).status, "settling");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn detects_settles_waits_for_confirmation_then_qualifies() {
         let source = source();

@@ -235,6 +235,7 @@ selection using GGA. Active direct mountpoints appear in the sourcetable.
 Offline fixed mountpoints return 503, and duplicate publishers return 409.
 Publisher mountpoints must be distinct from the virtual mountpoint and all
 upstream stations; use letters, digits, underscores, periods, and hyphens.
+The reserved names `.` and `..` are rejected.
 
 ### Direct-source onboarding
 

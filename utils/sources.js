@@ -6,8 +6,8 @@ function validateSources(config) {
     if (config.sources !== undefined && !Array.isArray(config.sources)) return 'Sources must be an array';
     const mounts = new Set([config.mountPoint, ...(config.stations || []).map(s => s.mountPoint)]);
     for (const s of config.sources || []) {
-        if (!s || typeof s.mountPoint !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(s.mountPoint) || mounts.has(s.mountPoint)) {
-            return 'Source mountpoints must be unique and use letters, digits, _, - or .';
+        if (!s || typeof s.mountPoint !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(s.mountPoint) || ['.', '..'].includes(s.mountPoint) || mounts.has(s.mountPoint)) {
+            return 'Source mountpoints must be unique, cannot be . or .., and must use letters, digits, _, - or .';
         }
         mounts.add(s.mountPoint);
         if (typeof s.username !== 'string' || typeof s.password !== 'string' || !s.password) return 'Publisher username and a nonempty password are required';

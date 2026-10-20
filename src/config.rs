@@ -114,6 +114,7 @@ impl Config {
         }
         for source in &self.sources {
             if source.mount_point.is_empty()
+                || matches!(source.mount_point.as_str(), "." | "..")
                 || !source
                     .mount_point
                     .bytes()
@@ -121,7 +122,7 @@ impl Config {
                 || !mounts.insert(source.mount_point.as_str())
             {
                 return Err(
-                    "source mountpoints must be unique and use letters, digits, _, - or .".into(),
+                    "source mountpoints must be unique, cannot be . or .., and must use letters, digits, _, - or .".into(),
                 );
             }
             if source.password.is_empty() {
@@ -209,6 +210,8 @@ mod tests {
         assert!(Config::parse(valid).is_ok());
         for invalid in [
             valid.replace("\"mountPoint\":\"BASE\"", "\"mountPoint\":\"NEAR\""),
+            valid.replace("\"mountPoint\":\"BASE\"", "\"mountPoint\":\".\""),
+            valid.replace("\"mountPoint\":\"BASE\"", "\"mountPoint\":\"..\""),
             valid.replace("\"latitude\":0", "\"latitude\":91"),
             valid.replace("\"longitude\":0", "\"longitude\":null"),
             valid.replace("\"password\":\"s\"", "\"password\":\"\""),

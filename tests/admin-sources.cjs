@@ -13,6 +13,7 @@ test('publisher validation accepts zero coordinates and rejects collisions and i
     assert.equal(validateSources({ ...config, sources: [{ ...base, latitude: null, longitude: null }] }), null);
     for (const source of [
         { ...base, mountPoint: 'NEAR' }, { ...base, latitude: 91 },
+        { ...base, mountPoint: '.' }, { ...base, mountPoint: '..' },
         { ...base, longitude: null }, { ...base, latitude: '0' },
         { ...base, password: '' }, { ...base, mountPoint: 'bad\r\nSTR' },
         { ...base, active: 'false' },
@@ -45,7 +46,7 @@ test('health snapshots expire and publisher API data excludes passwords', () => 
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-function apiFixture(realConfigPath) {
+function apiFixture(realConfigPath, realFs = fs) {
     const routes = new Map();
     let config = { mountPoint: 'NEAR', stations: [], sources: [], adminPassword: 'admin-secret' };
     if (realConfigPath) config = JSON.parse(fs.readFileSync(realConfigPath, 'utf8'));
@@ -61,8 +62,10 @@ function apiFixture(realConfigPath) {
             if (name === 'express') return express;
             if (['cors', 'morgan', 'express-basic-auth'].includes(name)) return () => () => {};
             if (name === 'path') return path;
-            if (name === 'fs') return realConfigPath ? fs : {
+            if (name === 'fs') return realConfigPath ? realFs : {
                 realpathSync(file) { return file; },
+                statSync() { return { mode: 0o600 }; },
+                mkdtempSync(prefix) { return prefix + 'test'; }, rmSync() {},
                 existsSync() { return true; }, writeFileSync(_p, value) { saved = JSON.parse(value); },
                 renameSync() {},
             };
@@ -249,4 +252,44 @@ test('dashboard renders onboarding countdown and preserves edited settling setti
     await refresh();
     assert.equal(body.children[0].children[3].children[0].textContent, 'Needs attention');
     assert.equal(body.children[0].children[3].children[1].textContent, 'Reported position changed');
+});
+
+
+test('config saves keep credentials private before and after atomic replacement', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neartrip-private-config-'));
+    try {
+        const target = path.join(dir, 'volume-config.json');
+        const link = path.join(dir, 'config.json');
+        fs.writeFileSync(target, JSON.stringify({ mountPoint: 'NEAR', stations: [], sources: [] }), { mode: 0o600 });
+        fs.symlinkSync(target, link);
+        const stale = target + '.tmp';
+        fs.writeFileSync(stale, 'unrelated stale temporary file', { mode: 0o644 });
+        let writes = 0;
+        const watchedFs = { ...fs, writeFileSync(file, text, options) {
+            assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+            assert.equal(options.mode, 0o600, 'restrict permissions before writing credentials');
+            assert.equal(options.flag, 'wx');
+            fs.writeFileSync(file, text, options);
+            assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+            writes++;
+        }};
+        const api = apiFixture(link, watchedFs);
+        assert.equal(api.request('post', '/api/sources', base).code, 201);
+        assert.equal(api.request('put', '/api/sources/:mountPoint', { password: 'rotated' }).code, 200);
+        assert.equal(writes, 2);
+        assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+        assert.ok(fs.lstatSync(link).isSymbolicLink());
+        assert.equal(fs.readFileSync(stale, 'utf8'), 'unrelated stale temporary file');
+        assert.deepEqual(fs.readdirSync(dir).sort(), ['config.json', 'volume-config.json', 'volume-config.json.tmp']);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('publisher APIs reject reserved dot mountpoints without saving them', () => {
+    const api = apiFixture();
+    for (const mountPoint of ['.', '..']) {
+        assert.equal(api.request('post', '/api/sources', { ...base, mountPoint }).code, 400);
+        assert.equal(api.request('put', '/api/config', { mountPoint: 'NEAR', stations: [], sources: [{ ...base, mountPoint }] }).code, 400);
+    }
+    assert.equal(api.config().sources.length, 0);
+    assert.equal(api.request('post', '/api/sources', { ...base, mountPoint: 'base.v1' }).code, 201);
 });

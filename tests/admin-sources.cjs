@@ -293,3 +293,37 @@ test('publisher APIs reject reserved dot mountpoints without saving them', () =>
     assert.equal(api.config().sources.length, 0);
     assert.equal(api.request('post', '/api/sources', { ...base, mountPoint: 'base.v1' }).code, 201);
 });
+
+
+test('publisher creation reserves the core default when the virtual mountpoint is omitted', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neartrip-default-mount-'));
+    try {
+        const file = path.join(dir, 'config.json');
+        const original = JSON.stringify({ stations: [], sources: [] });
+        fs.writeFileSync(file, original);
+        const api = apiFixture(file);
+        const result = api.request('post', '/api/sources', { ...base, mountPoint: 'NEAR-Default' });
+        assert.equal(result.code, 400);
+        assert.equal(api.config().sources.length, 0);
+        assert.equal(fs.readFileSync(file, 'utf8'), original, 'rejected configuration must not be saved');
+        assert.equal(api.request('post', '/api/sources', base).code, 201);
+        assert.equal(api.config().sources[0].mountPoint, 'BASE');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the publisher form and API accept sub-centimeter tolerances during unrelated edits', () => {
+    const html = fs.readFileSync(path.join(__dirname, '../admin/public/index.html'), 'utf8');
+    const input = html.match(/<input\b[^>]*\bid="sourceTolerance"[^>]*>/)[0];
+    const minimum = Number(input.match(/\bmin="([^"]+)"/)?.[1] ?? -Infinity);
+    const maximum = Number(input.match(/\bmax="([^"]+)"/)?.[1] ?? Infinity);
+    for (const tolerance of [0.005, 0.000001]) {
+        assert.ok(tolerance >= minimum && tolerance <= maximum, 'form must accept a valid server tolerance');
+        const api = apiFixture();
+        assert.equal(api.request('post', '/api/sources', { ...base, positionToleranceM: tolerance }).code, 201);
+        const result = api.request('put', '/api/sources/:mountPoint', { username: 'new-publisher' });
+        assert.equal(result.code, 200);
+        assert.equal(result.data.positionToleranceM, tolerance);
+        assert.equal(api.config().sources[0].username, 'new-publisher');
+        assert.equal(api.request('put', '/api/sources/:mountPoint', { positionToleranceM: 0 }).code, 400);
+    }
+});

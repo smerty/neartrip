@@ -30,8 +30,11 @@ impl Decoder {
             self.buffer.push(*byte);
             loop {
                 if self.buffer.first() != Some(&0xd3) {
-                    self.buffer.clear();
-                    break;
+                    self.resync();
+                    if self.buffer.is_empty() {
+                        break;
+                    }
+                    continue;
                 }
                 if self.buffer.len() < 3 {
                     break;
@@ -218,6 +221,34 @@ mod tests {
             assert!((position.latitude - lat).abs() < 1e-8);
             assert!((position.longitude - lon).abs() < 0.0001);
             assert!((position.ellipsoidal_height_m - height).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn oversized_corrupt_frame_preserves_both_position_reports_across_noise() {
+        let first = frame(1005, [6_378_237.0, 0.0, 0.0], 0);
+        let mut second = frame(1006, [6_378_247.0, 0.0, 0.0], 0);
+        second[5] |= 1; // Change station ID from 42 to 43.
+        let end = second.len() - 3;
+        let checksum = crc24q(&second[..end]);
+        second[end..].copy_from_slice(&checksum.to_be_bytes()[1..]);
+        let mut corrupt = vec![0xd3, 3, 0xff]; // Bogus 1023-byte payload.
+        corrupt.extend(&first);
+        corrupt.extend([0x11, 0x22, 0x33]);
+        corrupt.extend(&second);
+        corrupt.resize(1029, 0);
+        assert_ne!(crc24q(&corrupt[..1026]), 0);
+        for chunk_size in [1, 7, 1029] {
+            let mut decoder = Decoder::default();
+            let reports: Vec<_> = corrupt
+                .chunks(chunk_size)
+                .flat_map(|chunk| decoder.feed_positions(chunk))
+                .collect();
+            assert_eq!(reports.len(), 2, "chunk size {chunk_size}");
+            assert_eq!(reports[0].station_id, 42);
+            assert_eq!(reports[1].station_id, 43);
+            assert!((reports[1].ellipsoidal_height_m - 110.0).abs() < 0.001);
+            assert!(decoder.buffer.is_empty());
         }
     }
 

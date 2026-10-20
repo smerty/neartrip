@@ -28,6 +28,19 @@ struct SourceState {
     decoder: crate::rtcm::Decoder,
     position: Option<crate::rtcm::Position>,
 }
+impl SourceState {
+    fn ready(&self, source: &Source) -> bool {
+        self.qualification
+            .view(
+                source,
+                self.tx.is_some(),
+                self.last_data.is_some(),
+                self.last_data.is_some_and(|at| at.elapsed() < FRESH_FOR),
+            )
+            .status
+            == "ready"
+    }
+}
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
@@ -58,17 +71,18 @@ impl Hub {
         let Some(state) = streams.get(&source.mount_point) else {
             return false;
         };
-        state
-            .qualification
-            .view(
-                source,
-                state.tx.is_some(),
-                state.last_data.is_some(),
-                state.last_data.is_some_and(|at| at.elapsed() < FRESH_FOR),
-            )
-            .status
-            == "ready"
+        state.ready(source)
     }
+    /// Nearest clients must qualify on the same publisher state they subscribe to.
+    pub fn subscribe_ready(&self, source: &Source) -> Option<broadcast::Receiver<Vec<u8>>> {
+        let streams = self.streams.lock().unwrap();
+        let state = streams.get(&source.mount_point)?;
+        if !state.ready(source) {
+            return None;
+        }
+        state.tx.as_ref().map(|tx| tx.subscribe())
+    }
+
     pub fn subscribe(&self, mount: &str) -> Option<broadcast::Receiver<Vec<u8>>> {
         self.streams
             .lock()
@@ -471,6 +485,82 @@ mod tests {
         assert!(!serde_json::to_string(&hub.health(&config))
             .unwrap()
             .contains("secret"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nearest_subscription_rechecks_qualification_after_selection() {
+        let config = Config::parse(r#"{"sources":[{"mountPoint":"BASE","username":"b","password":"s","settlingSeconds":1}]}"#).unwrap();
+        let source = &config.sources[0];
+        let hub = Hub::default();
+        let install_publisher = || {
+            let (tx, _) = broadcast::channel(64);
+            hub.streams.lock().unwrap().insert(
+                "BASE".into(),
+                SourceState {
+                    tx: Some(tx),
+                    connected_at: now_ms(),
+                    last_data: None,
+                    last_data_at: None,
+                    bytes_received: 0,
+                    last_error: None,
+                    qualification: crate::onboarding::Qualification::default(),
+                    decoder: crate::rtcm::Decoder::default(),
+                    position: None,
+                },
+            );
+        };
+        let mut position = crate::rtcm::Position {
+            latitude: 37.0,
+            longitude: -122.0,
+            ellipsoidal_height_m: 100.0,
+            antenna_height_m: None,
+            station_id: 42,
+            message_type: 1005,
+        };
+        let report = |position: &crate::rtcm::Position| {
+            let mut streams = hub.streams.lock().unwrap();
+            let state = streams.get_mut("BASE").unwrap();
+            state.position = Some(position.clone());
+            state
+                .qualification
+                .observe(source, Some(position), true, false);
+            state.last_data = Some(tokio::time::Instant::now());
+        };
+        install_publisher();
+        report(&position);
+        assert!(hub.subscribe_ready(source).is_none());
+        assert!(
+            hub.subscribe("BASE").is_some(),
+            "fixed clients remain ungated"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        report(&position);
+        assert_eq!(hub.stations(&config).len(), 1);
+        assert!(hub.subscribe_ready(source).is_some());
+
+        // Movement happens after the selection snapshot but before subscription.
+        position.ellipsoidal_height_m += 10.0;
+        report(&position);
+        assert!(hub.subscribe_ready(source).is_none());
+        assert!(hub.subscribe("BASE").is_some());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        report(&position);
+        assert!(hub.subscribe_ready(source).is_some());
+
+        // Replacement publisher must not inherit the selected publisher's admission.
+        assert_eq!(hub.stations(&config).len(), 1);
+        install_publisher();
+        report(&position);
+        assert!(hub.subscribe_ready(source).is_none());
+        assert!(hub.subscribe("BASE").is_some());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        report(&position);
+        assert!(hub.subscribe_ready(source).is_some());
+        tokio::time::advance(FRESH_FOR).await;
+        assert!(
+            hub.subscribe_ready(source).is_none(),
+            "stale sources cannot attach"
+        );
     }
 
     #[test]

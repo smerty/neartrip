@@ -569,8 +569,8 @@ async fn ensure_upstream(
     if current_mount.as_deref() == Some(mount.as_str()) {
         return;
     }
-    if config.sources.iter().any(|s| s.mount_point == mount) {
-        if let Some(receiver) = hub.subscribe(&mount) {
+    if let Some(source) = config.sources.iter().find(|s| s.mount_point == mount) {
+        if let Some(receiver) = hub.subscribe_ready(source) {
             *attempt = None;
             *last_fail = None;
             *upstream = Some(Upstream {

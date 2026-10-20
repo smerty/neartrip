@@ -399,15 +399,47 @@ server, then restart them to enable these features.
 
 ### Member accounts and rover self-service
 
-Administrators create member accounts under **Users → Members**, supplying a
-username and a dashboard password (at least 12 characters). There is no public
-registration. Dashboard passwords use salted scrypt hashes, separate from NTRIP
-passwords. Members sign in at `/login`, view stations, and use **My rover
-credentials** (`/rovers`) to create up to ten credentials, rotate generated
-passwords, or enable/disable individual rovers. Generated passwords are displayed
-once. Rotation disconnects existing rover streams within approximately one second
-of configuration reload; clients must reconnect using the new password. Ownership is assigned on the server; members cannot inspect other members'
-credentials or reach admin APIs.
+Administrators allowlist members under **Users → Members** with a username and
+unique email address. Only enabled, invited email addresses receive magic links;
+there is no public registration. Existing members must have an email added before
+they can sign in. Dashboard password login is replaced by email links; admin
+HTTP Basic authentication and NTRIP credentials are unchanged.
+
+Members enter their email at `/login`, open the emailed link, and click **Confirm
+sign in**. Links expire after 15 minutes and can be used once. A one-minute
+per-member cooldown limits repeated sends while a link is pending. The response does not disclose
+whether an email is invited. Links and sessions reset when Node restarts;
+changing a member or disabling it revokes pending links and dashboard sessions.
+Run a single Node instance (authentication state is in memory).
+
+Set these production environment variables, then restart Node/Compose:
+
+```dotenv
+PUBLIC_HOSTNAME=rtk.k6sh.com
+MAIL_FROM=NearTRIP <login@example.com>
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=your-smtp-username
+SMTP_PASSWORD=your-smtp-password
+NEARTRIP_SECURE_COOKIES=true
+```
+
+Sign-in links use `https://PUBLIC_HOSTNAME`, the same hostname used by Traefik.
+SMTP defaults to port 465 with TLS enabled.
+
+Port 587 uses required STARTTLS with `SMTP_SECURE=false`; port 465
+uses TLS from connection start with `SMTP_SECURE=true`. Certificate
+verification stays enabled. SMTP authentication is optional for a trusted relay
+(omit both user and password). Use a sender address authorized by your mail
+provider. The configured public URL is the canonical HTTPS origin used in
+emails; request Host headers never determine sign-in links. Without SMTP host,
+sender, or public URL, no emails are sent. Delivery failures are logged without
+recipient addresses or tokens. Docker Compose forwards all variables above.
+
+Members use **My rover credentials** (`/rovers`) to create up to ten credentials,
+rotate generated passwords, or enable/disable individual rovers. Generated
+passwords are displayed once. Ownership is assigned on the server.
 
 Disabling a member immediately invalidates dashboard sessions and blocks their
 rover credentials. Existing rover sockets close on the core's next policy check
@@ -417,12 +449,10 @@ Once any member is configured, legacy shared/anonymous fallback is disabled;
 existing standalone rover accounts remain valid but are not assigned to a member
 automatically. Existing publishers are unaffected by member changes.
 
-Dashboard sessions expire after eight hours and reset when Node restarts. Login
-failures are limited to 100 per client IP per five minutes when proxy trust is
-configured. Repeated failures for one account trigger a short backoff (250 ms to
-two seconds), and at most four login password checks run concurrently. Successful logins do not consume failure
-budgets. Unknown usernames consume no account-tracking slots, and a full tracking
-table evicts idle entries rather than blocking unrelated logins. Member mutations
+Dashboard sessions expire after eight hours and reset when Node restarts.
+Magic-link requests have a 100-request per-client-IP budget per five minutes
+when trusted proxies are configured, account backoff, and bounded send concurrency.
+Member mutations
 require a session CSRF token. Serve the dashboard through HTTPS. With TLS
 terminating at a reverse proxy, set `NEARTRIP_SECURE_COOKIES=true` on Node to require secure
 session cookies; forwarded identity/IP headers are not trusted automatically.

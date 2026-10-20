@@ -4,7 +4,7 @@
     async function api(path, method = 'GET', body) {
         const res = await fetch('/api/member/' + path, { method, headers: { 'Content-Type': 'application/json', ...(csrf ? { 'X-CSRF-Token': csrf } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
         const data = await res.json();
-        if (!res.ok) { if (res.status === 401 && path !== 'login') location.assign('/login'); throw new Error(data.error || 'Request failed'); }
+        if (!res.ok) { if (res.status === 401 && !['login', 'verify'].includes(path)) location.assign('/login'); throw new Error(data.error || 'Request failed'); }
         return data;
     }
     async function run(fn) {
@@ -19,7 +19,17 @@
         }
     }
     const login = document.getElementById('loginForm');
-    if (login) { login.addEventListener('submit', e => { e.preventDefault(); run(async () => { await api('login', 'POST', { username: document.getElementById('username').value, password: document.getElementById('password').value }); location.assign('/'); }); }); return; }
+    if (login) {
+        const token = location.hash.slice(1);
+        if (token) {
+            history.replaceState(null, '', '/login');
+            const button = login.querySelector('button');
+            login.querySelector('#email').required = false;
+            button.textContent = 'Confirm sign in';
+            login.addEventListener('submit', e => { e.preventDefault(); run(async () => { await api('verify', 'POST', { token }); location.assign('/'); }); });
+        } else login.addEventListener('submit', e => { e.preventDefault(); run(async () => { const result = await api('login', 'POST', { email: document.getElementById('email').value }); document.getElementById('message').textContent = result.message; }); });
+        return;
+    }
     const secret = data => { const el = document.getElementById('newCredentials'); el.hidden = false; el.textContent = 'Username: ' + data.username + '\nPassword: ' + data.password + '\nCopy now — this password will not be displayed again.'; el.focus(); };
     async function load() {
         const data = await api('rovers'), root = document.getElementById('rovers'); root.replaceChildren();

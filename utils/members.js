@@ -1,46 +1,41 @@
 const crypto = require('crypto');
 const path = require('path');
+const { createMailer } = require('./member-mail');
 const { LoginLimiter } = require('./login-limiter');
-const { promisify } = require('util');
-const scrypt = promisify(crypto.scrypt);
 const nameOK = s => typeof s === 'string' && /^[A-Za-z0-9_.@-]{1,64}$/.test(s) && !['.', '..'].includes(s);
-async function hashPassword(password) {
-    if (typeof password !== 'string' || password.length < 12 || Buffer.byteLength(password) > 256) throw new Error('Use a password of 12–256 bytes');
-    const salt = crypto.randomBytes(16).toString('hex');
-    return salt + ':' + (await scrypt(password, salt, 64)).toString('hex');
-}
-async function verify(password, hash) {
-    const [salt, digest] = (hash || '').split(':');
-    if (!salt || !digest || typeof password !== 'string' || Buffer.byteLength(password) > 256) return false;
-    const actual = await scrypt(password, salt, 64), expected = Buffer.from(digest, 'hex');
-    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
-}
+const emailOf = value => typeof value === 'string' ? value.trim().toLowerCase() : '';
+const emailOK = value => /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$/.test(value) && value.length <= 254;
+const versionOf = m => JSON.stringify([m.passwordHash, m.email]);
 function validateMembers(c) {
     if (c.members !== undefined && !Array.isArray(c.members)) return 'Invalid members';
-    const seen = new Set();
+    const seen = new Set(), emails = new Set();
     for (const m of c.members || []) {
-        if (!m || !nameOK(m.username) || seen.has(m.username) || !/^[a-f0-9]{32}:[a-f0-9]{128}$/.test(m.passwordHash) || typeof m.active !== 'boolean') return 'Invalid or duplicate member';
+        if (!m || !nameOK(m.username) || seen.has(m.username) || (m.passwordHash !== undefined && !/^[a-f0-9]{32}:[a-f0-9]{128}$/.test(m.passwordHash)) || typeof m.active !== 'boolean') return 'Invalid or duplicate member';
+        if (m.email !== undefined && (!emailOK(m.email) || m.email !== emailOf(m.email) || emails.has(m.email))) return 'Invalid or duplicate member email';
+        if (!m.email && !m.passwordHash) return 'Member requires an email';
+        if (m.email) emails.add(m.email);
         seen.add(m.username);
     }
     for (const u of c.users || []) if (u.owner !== undefined && !seen.has(u.owner)) return 'Rover owner must reference a member';
     return null;
 }
 function setupMembers(app, manager, save, admin) {
-    const sessions = new Map(), limiter = new LoginLimiter();
+    const sessions = new Map(), limiter = new LoginLimiter(), links = new Map(), mailer = admin.mailer || createMailer();
     const invalidate = config => {
+        for (const [token, link] of links) if (!(config.members || []).some(m => m.username === link.username && m.active && versionOf(m) === link.version)) links.delete(token);
         for (const [token, session] of sessions) {
-            if (!(config.members || []).some(m => m.username === session.username && m.active && m.passwordHash === session.version)) sessions.delete(token);
+            if (!(config.members || []).some(m => m.username === session.username && m.active && versionOf(m) === session.version)) sessions.delete(token);
         }
     };
     const unsubscribe = manager.subscribeConfig?.(invalidate);
     const root = path.join(__dirname, '..', 'web', 'public');
-    const safe = m => ({ username: m.username, active: m.active });
+    const safe = m => ({ username: m.username, email: m.email || '', active: m.active });
     const current = req => {
         const token = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('neartrip_session='))?.slice(17);
         const session = sessions.get(token);
         if (!session || session.until < Date.now()) { sessions.delete(token); return null; }
         let member;
-        try { member = (manager.getConfig().members || []).find(m => m.username === session.username && m.active && m.passwordHash === session.version); }
+        try { member = (manager.getConfig().members || []).find(m => m.username === session.username && m.active && versionOf(m) === session.version); }
         catch { sessions.delete(token); return null; }
         if (!member) { sessions.delete(token); return null; }
         return { member, token, csrf: session.csrf };
@@ -74,37 +69,40 @@ function setupMembers(app, manager, save, admin) {
         }
         next();
     });
+    const digest = token => crypto.createHash('sha256').update(token).digest('hex');
     app.post('/api/member/login', async (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
-        const now = Date.now();
-        // req.ip honors forwarding headers only from explicitly trusted proxies.
-        const username = nameOK(req.body?.username) ? req.body.username : '<invalid>';
-        // Without configured proxy trust the peer may represent every member.
-        // Keep account backoff/concurrency protection, but never hard-block that peer.
+        const email = emailOf(req.body?.email), now = Date.now();
         let m;
-        try { m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active); }
-        catch { return res.status(400).json({ error: 'Invalid login' }); }
-        const attempt = limiter.begin(req.ip, username, { limitIp: admin.clientIpLimits === true, knownAccount: Boolean(m) });
-        if (!attempt.finish) {
-            res.setHeader('Retry-After', String(attempt.retryAfter));
-            return res.status(429).json({ error: 'Too many login attempts. Try again shortly.' });
-        }
-        let success = false;
+        try { m = (manager.getConfig().members || []).find(m => m.email === email && m.active); }
+        catch { return res.status(400).json({ error: 'Unable to read member configuration' }); }
+        const attempt = limiter.begin(req.ip, email, { limitIp: admin.clientIpLimits === true, knownAccount: Boolean(m) });
+        if (!attempt.finish) return res.status(429).json({ error: 'Too many requests. Try again shortly.' });
         try {
-            // Also run the KDF for unknown accounts.
-            const valid = await verify(req.body?.password, m?.passwordHash || '00000000000000000000000000000000:' + '0'.repeat(128));
-            if (!m || !valid) return res.status(401).json({ error: 'Invalid login' });
-            const latest = (manager.getConfig().members || []).find(x => x.username === m.username && x.active && x.passwordHash === m.passwordHash);
-            if (!latest) return res.status(401).json({ error: 'Invalid login' });
-            for (const [key, value] of sessions) if (value.until < now) sessions.delete(key);
-            if (sessions.size >= 10000) return res.status(503).json({ error: 'Try again later' });
-            const token = crypto.randomBytes(32).toString('hex');
-            sessions.set(token, { username: m.username, version: m.passwordHash, csrf: crypto.randomBytes(32).toString('hex'), until: now + 8 * 3600000 });
-            res.setHeader('Set-Cookie', 'neartrip_session=' + token + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800' + (req.secure || process.env.NEARTRIP_SECURE_COOKIES === 'true' ? '; Secure' : ''));
-            success = true;
-            res.json(safe(m));
-        } catch { res.status(400).json({ error: 'Invalid login' }); }
-        finally { attempt.finish(success); }
+            for (const [key, value] of links) if (value.until <= now) links.delete(key);
+            if (m && mailer && links.size < 10000 && ![...links.values()].some(v => v.username === m.username && v.sent > now - 60000)) {
+                const token = crypto.randomBytes(32).toString('hex'), key = digest(token);
+                links.set(key, { username: m.username, version: versionOf(m), until: now + 900000, sent: now });
+                try { await mailer.send(email, token); }
+                catch { links.delete(key); console.error('Member sign-in email delivery failed'); }
+            }
+            res.json({ message: 'If this email is invited, a sign-in link will arrive shortly.' });
+        } finally { attempt.finish(false); }
+    });
+    app.post('/api/member/verify', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
+        const raw = req.body?.token;
+        if (typeof raw !== 'string' || !/^[a-f0-9]{64}$/.test(raw)) return res.status(401).json({ error: 'Invalid or expired sign-in link' });
+        const key = digest(raw), link = links.get(key);
+        links.delete(key);
+        const m = link && link.until > Date.now() && (manager.getConfig().members || []).find(m => m.username === link.username && m.active && versionOf(m) === link.version);
+        if (!m) return res.status(401).json({ error: 'Invalid or expired sign-in link' });
+        for (const [key, value] of sessions) if (value.until <= Date.now()) sessions.delete(key);
+        if (sessions.size >= 10000) return res.status(503).json({ error: 'Try again later' });
+        const token = crypto.randomBytes(32).toString('hex');
+        sessions.set(token, { username: m.username, version: versionOf(m), csrf: crypto.randomBytes(32).toString('hex'), until: Date.now() + 8 * 3600000 });
+        res.setHeader('Set-Cookie', 'neartrip_session=' + token + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800' + (req.secure || process.env.NEARTRIP_SECURE_COOKIES === 'true' ? '; Secure' : ''));
+        res.json(safe(m));
     });
     app.use('/api/member', memberGuard);
     app.get('/api/member/me', (req, res) => res.json({ ...safe(req.memberSession.member), csrf: req.memberSession.csrf }));
@@ -143,13 +141,16 @@ function setupMembers(app, manager, save, admin) {
             if (!nameOK(username) || pending.has(username)) return res.status(400).json({ error: 'Invalid username or update in progress' });
             pending.add(username);
             try {
-                const passwordHash = create || req.body?.password ? await hashPassword(req.body?.password) : null;
                 const c = manager.getConfig(), members = c.members || [], existing = members.find(m => m.username === username);
+                const email = req.body?.email === undefined ? existing?.email : emailOf(req.body.email);
+                if (!emailOK(email)) throw new Error('Enter a valid invited email address');
                 if (create ? existing : !existing) return res.status(409).json({ error: create ? 'Member already exists' : 'Member not found' });
                 if (req.body?.active !== undefined && typeof req.body.active !== 'boolean') throw new Error('Invalid active status');
-                const member = { ...(existing || {}), username, active: req.body?.active ?? existing?.active ?? true, ...(passwordHash ? { passwordHash } : {}) };
+                const member = { ...(existing || {}), username, active: req.body?.active ?? existing?.active ?? true, email };
+                if (members.some(m => m.username !== username && m.email === email)) throw new Error('Email already invited');
                 save({ ...c, members: create ? [...members, member] : members.map(m => m === existing ? member : m) });
                 for (const [key, value] of sessions) if (value.username === username) sessions.delete(key);
+                for (const [key, value] of links) if (value.username === username) links.delete(key);
                 res.status(create ? 201 : 200).json(safe(member));
             } catch (error) { res.status(400).json({ error: error.message }); }
             finally { pending.delete(username); }
@@ -158,4 +159,4 @@ function setupMembers(app, manager, save, admin) {
         app.put('/api/members/:username', (req, res) => change(req, res, false));
     } };
 }
-module.exports = { setupMembers, validateMembers, hashPassword };
+module.exports = { setupMembers, validateMembers };

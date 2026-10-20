@@ -121,14 +121,18 @@ with the SparkFun RTK Express. Optional `connectionLimits` settings hot reload:
 
 `maxConnections` includes established and pending sockets. Pending handshakes
 have a separate global/per-IP allowance and an absolute deadline that incoming
-bytes cannot extend. Successful authentication releases the pending allowance;
-there is no per-IP established-rover limit, allowing shared cellular addresses.
+bytes cannot extend. Successful rover/publisher authentication releases the
+pending allowance before the success response; there is no per-IP established
+rover limit, allowing shared cellular addresses.
 At capacity, new sockets close without allocating a session or log task.
 The total connection limit is at most 8192, pending at most 1024, and handshake
 timeout 1–60 seconds. Pending limits must fit inside the total limit.
 
 Session records retain at most 16,384 entries and seven days of closed history;
-active sessions are never evicted. Eviction/expiry removes associated NMEA logs.
+active sessions are never evicted. A closed-session queue and swap removal keep
+capacity eviction constant-time without reindexing the registry. Log deletion
+runs outside the registry mutex; eviction also signals detached writers so files
+created late are removed rather than orphaned.
 NMEA files are created only when a rover emits valid position data, with a 1 MiB
 limit per session and a bounded write queue. Logging stops at that limit while
 correction streaming continues. Session cleanup runs on errors, cancellation,
@@ -415,10 +419,12 @@ automatically. Existing publishers are unaffected by member changes.
 
 Dashboard sessions expire after eight hours and reset when Node restarts. Login
 failures are limited to 100 per client IP per five minutes when proxy trust is
-configured. Repeated failures for one account trigger a short backoff (250 ms to two seconds), and at most four
-login password checks run concurrently. Successful logins do not consume failure
-budgets. Member mutations require a session CSRF token. Serve the dashboard through HTTPS. With TLS terminating at
-a reverse proxy, set `NEARTRIP_SECURE_COOKIES=true` on Node to require secure
+configured. Repeated failures for one account trigger a short backoff (250 ms to
+two seconds), and at most four login password checks run concurrently. Successful logins do not consume failure
+budgets. Unknown usernames consume no account-tracking slots, and a full tracking
+table evicts idle entries rather than blocking unrelated logins. Member mutations
+require a session CSRF token. Serve the dashboard through HTTPS. With TLS
+terminating at a reverse proxy, set `NEARTRIP_SECURE_COOKIES=true` on Node to require secure
 session cookies; forwarded identity/IP headers are not trusted automatically.
 
 Behind Traefik or another reverse proxy, set `NEARTRIP_TRUSTED_PROXIES` to a

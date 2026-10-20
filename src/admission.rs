@@ -3,7 +3,10 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -47,8 +50,7 @@ struct Counts {
 pub(crate) struct Admission(Arc<Mutex<Counts>>);
 pub(crate) struct Lease {
     admission: Admission,
-    ip: IpAddr,
-    pending: bool,
+    pending: Pending,
 }
 impl Admission {
     pub fn acquire(&self, ip: IpAddr, limits: &Limits) -> Option<Lease> {
@@ -65,25 +67,45 @@ impl Admission {
         *c.peers.entry(ip).or_default() += 1;
         Some(Lease {
             admission: self.clone(),
-            ip,
-            pending: true,
+            pending: Pending(Arc::new(PendingState {
+                admission: self.clone(),
+                ip,
+                pending: AtomicBool::new(true),
+            })),
         })
     }
 }
-impl Lease {
-    pub fn authenticated(&mut self) {
-        if !self.pending {
+#[derive(Clone)]
+pub(crate) struct Pending(Arc<PendingState>);
+struct PendingState {
+    admission: Admission,
+    ip: IpAddr,
+    pending: AtomicBool,
+}
+impl Pending {
+    pub fn release(&self) {
+        if !self.0.pending.swap(false, Ordering::AcqRel) {
             return;
         }
-        let mut c = self.admission.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.0.admission.0.lock().unwrap_or_else(|e| e.into_inner());
         c.pending -= 1;
-        if let Some(n) = c.peers.get_mut(&self.ip) {
+        if let Some(n) = c.peers.get_mut(&self.0.ip) {
             *n -= 1;
             if *n == 0 {
-                c.peers.remove(&self.ip);
+                c.peers.remove(&self.0.ip);
             }
         }
-        self.pending = false;
+    }
+}
+impl Lease {
+    pub fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+    pub fn is_pending(&self) -> bool {
+        self.pending.0.pending.load(Ordering::Acquire)
+    }
+    pub fn authenticated(&self) {
+        self.pending.release();
     }
 }
 impl Drop for Lease {
@@ -109,7 +131,7 @@ mod tests {
             ..Limits::default()
         };
         let ip = "192.0.2.1".parse().unwrap();
-        let mut first = a.acquire(ip, &limits).unwrap();
+        let first = a.acquire(ip, &limits).unwrap();
         assert!(a
             .acquire("::ffff:192.0.2.1".parse().unwrap(), &limits)
             .is_none());

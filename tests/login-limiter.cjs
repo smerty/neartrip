@@ -83,3 +83,28 @@ test('unconfigured proxy fallback cannot hard-block a shared peer, but retains a
     for (let i = 0; i < 5; i++) limiter.begin('shared-proxy', 'guess', options).finish(false);
     assert.equal(limiter.begin('shared-proxy', 'guess', options).retryAfter, 1);
 });
+
+test('unknown username churn cannot consume account storage or block a configured member', () => {
+    const limiter = new LoginLimiter(() => 0);
+    for (let i = 0; i < 11000; i++) {
+        const attempt = limiter.begin('shared-proxy', 'unknown' + i, { limitIp: false, knownAccount: false });
+        assert.ok(attempt.finish);
+        attempt.finish(false);
+    }
+    assert.equal(limiter.entries.size, 0);
+    const valid = limiter.begin('shared-proxy', 'configured-member', { limitIp: false, knownAccount: true });
+    assert.ok(valid.finish);
+    valid.finish(true);
+});
+
+test('a full budget table evicts idle tracking instead of denying unrelated correct logins', () => {
+    const limiter = new LoginLimiter(() => 0);
+    for (let i = 0; i < 10000; i++) {
+        limiter.begin('ip' + i, 'unknown' + i, { knownAccount: false }).finish(false);
+    }
+    assert.equal(limiter.entries.size, 10000);
+    const inFlight = Array.from({ length: 4 }, (_, i) => limiter.begin('new-ip' + i, 'configured-member' + i));
+    assert.ok(inFlight.every(a => a.finish));
+    assert.ok(limiter.entries.size <= 10000);
+    inFlight.forEach(a => a.finish(true));
+});

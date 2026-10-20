@@ -101,7 +101,7 @@ pub async fn serve_with_hub(
                             continue;
                         }
                         let limits = configs.borrow().connection_limits.clone();
-                        let Some(mut lease) = admission.acquire(peer.ip(), &limits) else {
+                        let Some(lease) = admission.acquire(peer.ip(), &limits) else {
                             drop(socket);
                             continue;
                         };
@@ -110,10 +110,9 @@ pub async fn serve_with_hub(
                         let registry = Arc::clone(&registry);
                         let mut shutdown = shutdown.clone();
                         clients.spawn(async move {
-                            let live = registry.open(peer).await;
+                            let live = registry.open_admitted(peer, lease.pending());
                             let mut cleanup = SessionCleanup::new(&registry, &live.id);
                             let deadline = Instant::now() + Duration::from_secs(limits.handshake_timeout_seconds);
-                            let mut authenticated = false;
                             let policy_configs = configs.clone();
                             let session = handle_client(socket, peer, configs, &registry, &live, &hub);
                             tokio::pin!(session);
@@ -121,17 +120,10 @@ pub async fn serve_with_hub(
                             let reason = loop {
                                 tokio::select! {
                                     _ = shutdown.changed() => break "core shutdown".to_string(),
-                                    _ = tokio::time::sleep_until(deadline), if !authenticated => {
-                                        if registry.accepted(&live.id) {
-                                            authenticated = true;
-                                            lease.authenticated();
-                                        } else { break "handshake timeout".to_string(); }
+                                    _ = tokio::time::sleep_until(deadline), if lease.is_pending() => {
+                                        break "handshake timeout".to_string();
                                     }
                                     _ = policy_tick.tick() => {
-                                        if !authenticated && registry.accepted(&live.id) {
-                                            authenticated = true;
-                                            lease.authenticated();
-                                        }
                                         if registry.rover_revoked(&live.id, &policy_configs.borrow()) {
                                             break "rover access revoked".to_string();
                                         }

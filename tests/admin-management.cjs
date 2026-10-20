@@ -317,3 +317,22 @@ test('trusted proxy clients have independent login budgets and untrusted forward
         else process.env.NEARTRIP_TRUSTED_PROXIES = saved;
     }
 });
+
+test('ten thousand unknown usernames cannot deny a valid member login without proxy configuration', async () => {
+    const saved = process.env.NEARTRIP_TRUSTED_PROXIES;
+    delete process.env.NEARTRIP_TRUSTED_PROXIES;
+    const api = fixture();
+    try {
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        for (let i = 0; i < 10000; i++) {
+            const result = await api.request('/api/member/login', { method: 'POST', body: { username: 'unknown' + i } });
+            assert.equal(result.status, 401);
+        }
+        const login = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        assert.equal(login.status, 200);
+    } finally {
+        await api.close();
+        if (saved === undefined) delete process.env.NEARTRIP_TRUSTED_PROXIES;
+        else process.env.NEARTRIP_TRUSTED_PROXIES = saved;
+    }
+});

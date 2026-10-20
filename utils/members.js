@@ -81,14 +81,16 @@ function setupMembers(app, manager, save, admin) {
         const username = nameOK(req.body?.username) ? req.body.username : '<invalid>';
         // Without configured proxy trust the peer may represent every member.
         // Keep account backoff/concurrency protection, but never hard-block that peer.
-        const attempt = limiter.begin(req.ip, username, { limitIp: admin.clientIpLimits === true });
+        let m;
+        try { m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active); }
+        catch { return res.status(400).json({ error: 'Invalid login' }); }
+        const attempt = limiter.begin(req.ip, username, { limitIp: admin.clientIpLimits === true, knownAccount: Boolean(m) });
         if (!attempt.finish) {
             res.setHeader('Retry-After', String(attempt.retryAfter));
             return res.status(429).json({ error: 'Too many login attempts. Try again shortly.' });
         }
         let success = false;
         try {
-            const m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active);
             // Also run the KDF for unknown accounts.
             const valid = await verify(req.body?.password, m?.passwordHash || '00000000000000000000000000000000:' + '0'.repeat(128));
             if (!m || !valid) return res.status(401).json({ error: 'Invalid login' });

@@ -1,10 +1,13 @@
 //! Live session table written to `logs/sessions.json` for the admin UI.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,10 @@ struct SessionRecord {
     read_idle_timeout_secs: u64,
     #[serde(skip)]
     disconnected_unix: Option<u64>,
+    #[serde(skip)]
+    log_state: Arc<LogState>,
+    #[serde(skip)]
+    pending: Option<crate::admission::Pending>,
 }
 
 pub struct Registry {
@@ -69,18 +76,21 @@ pub struct Registry {
 struct SessionTable {
     records: Vec<SessionRecord>,
     by_id: HashMap<String, usize>,
+    closed: VecDeque<String>,
+    removed: Vec<SessionRecord>,
 }
 
 impl SessionTable {
     fn push(&mut self, record: SessionRecord) {
-        // Socket admission bounds active records. Evict closed history at capacity,
-        // including during bursts between periodic snapshots.
+        // Closed IDs form an eviction queue; swap removal updates only the moved
+        // record's index. Connection churn never shifts/reindexes the table.
         if self.records.len() >= MAX_RECORDS {
-            if let Some(index) = self.records.iter().position(|s| !s.active) {
-                let removed = self.records.remove(index);
-                remove_nmea_log(&removed);
-                self.reindex();
+            if let Some(id) = self.closed.pop_front() {
+                self.remove(&id);
             }
+        }
+        if !record.active {
+            self.closed.push_back(record.id.clone());
         }
         self.by_id.insert(record.id.clone(), self.records.len());
         self.records.push(record);
@@ -91,27 +101,52 @@ impl SessionTable {
         self.records.get_mut(index)
     }
 
-    fn prune(&mut self, now: u64) {
-        let previous_len = self.records.len();
-        self.records.retain(|session| {
-            let retain = session
-                .disconnected_unix
-                .map(|then| now.saturating_sub(then) < HISTORY_SECS)
-                .unwrap_or(true);
-            if !retain {
-                remove_nmea_log(session);
-            }
-            retain
-        });
-        if self.records.len() != previous_len {
-            self.reindex();
+    fn remove(&mut self, id: &str) {
+        let Some(index) = self.by_id.remove(id) else {
+            return;
+        };
+        let removed = self.records.swap_remove(index);
+        if let Some(moved) = self.records.get(index) {
+            *self.by_id.get_mut(&moved.id).expect("indexed session") = index;
         }
+        removed.log_state.evicted.store(true, Ordering::Release);
+        removed.log_state.changed.notify_one();
+        self.removed.push(removed);
     }
 
-    fn reindex(&mut self) {
-        self.by_id.clear();
-        for (index, session) in self.records.iter().enumerate() {
-            self.by_id.insert(session.id.clone(), index);
+    fn prune(&mut self, now: u64) {
+        let expired: Vec<_> = self
+            .records
+            .iter()
+            .filter(|s| {
+                s.disconnected_unix
+                    .is_some_and(|then| now.saturating_sub(then) >= HISTORY_SECS)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in expired {
+            self.remove(&id);
+        }
+        self.closed.retain(|id| self.by_id.contains_key(id));
+    }
+}
+
+#[derive(Default)]
+struct LogState {
+    evicted: AtomicBool,
+    changed: Notify,
+}
+
+// Eviction may occur before, during, or after asynchronous file creation.
+// The eviction path removes existing files; the writer removes late-created ones.
+struct LogCleanup {
+    state: Arc<LogState>,
+    path: String,
+}
+impl Drop for LogCleanup {
+    fn drop(&mut self) {
+        if self.state.evicted.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -129,6 +164,7 @@ fn remove_nmea_log(record: &SessionRecord) {
 pub struct LiveSession {
     pub(crate) id: String,
     nmea: OnceLock<mpsc::Sender<String>>,
+    log_state: Arc<LogState>,
 }
 
 impl Registry {
@@ -216,11 +252,30 @@ impl Registry {
     }
 
     pub async fn open(&self, peer: SocketAddr) -> LiveSession {
+        self.open_inner(peer, None)
+    }
+
+    pub(crate) fn open_admitted(
+        &self,
+        peer: SocketAddr,
+        pending: crate::admission::Pending,
+    ) -> LiveSession {
+        self.open_inner(peer, Some(pending))
+    }
+
+    fn open_inner(
+        &self,
+        peer: SocketAddr,
+        pending: Option<crate::admission::Pending>,
+    ) -> LiveSession {
         let id = session_id();
+        let log_state = Arc::new(LogState::default());
         let (now, _) = now_unix();
         self.with_mut(|sessions| {
             sessions.push(SessionRecord {
                 id: id.clone(),
+                log_state: log_state.clone(),
+                pending,
                 client_ip: display_ip(peer),
                 client_port: peer.port(),
                 connected_at: now,
@@ -245,6 +300,7 @@ impl Registry {
         LiveSession {
             id,
             nmea: OnceLock::new(),
+            log_state,
         }
     }
 
@@ -253,6 +309,9 @@ impl Registry {
             let session = sessions.get_mut(id)?;
             if session.role == "publisher" {
                 return None;
+            }
+            if let Some(pending) = session.pending.take() {
+                pending.release();
             }
             session.role = "publisher".into();
             session.status = "publishing".into();
@@ -324,8 +383,13 @@ impl Registry {
                     record.nmea_log_file = log_path.clone();
                 }
             });
+            let state = session.log_state.clone();
             tokio::spawn(async move {
                 let _permit = permit;
+                let cleanup = LogCleanup {
+                    state,
+                    path: log_path.clone(),
+                };
                 let mut options = OpenOptions::new();
                 options.create_new(true).write(true);
                 #[cfg(unix)]
@@ -338,7 +402,14 @@ impl Registry {
                     }
                 };
                 let mut written = 0;
-                while let Some(line) = rx.recv().await {
+                loop {
+                    if cleanup.state.evicted.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let line = tokio::select! {
+                        _ = cleanup.state.changed.notified() => continue,
+                        line = rx.recv() => match line { Some(line) => line, None => break },
+                    };
                     if written + line.len() > MAX_LOG_BYTES {
                         break;
                     }
@@ -399,6 +470,9 @@ impl Registry {
             let session = sessions.get_mut(id)?;
             if session.authenticated {
                 return None;
+            }
+            if let Some(pending) = session.pending.take() {
+                pending.release();
             }
             session.authenticated = true;
             session.role = "rover".into();
@@ -470,6 +544,7 @@ impl Registry {
                 session.disconnect_reason = Some(reason.into());
                 session.disconnected_at = Some(stamp);
                 session.disconnected_unix = Some(unix);
+                sessions.closed.push_back(id.to_owned());
             }
         });
         self.changed.notify_one();
@@ -509,7 +584,14 @@ impl Registry {
 
     fn with_mut<T>(&self, f: impl FnOnce(&mut SessionTable) -> T) -> T {
         let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        f(&mut guard)
+        let result = f(&mut guard);
+        let removed = std::mem::take(&mut guard.removed);
+        drop(guard);
+        // Filesystem work must not hold the mutex used by live rover updates.
+        for record in removed {
+            remove_nmea_log(&record);
+        }
+        result
     }
 }
 
@@ -650,6 +732,7 @@ mod tests {
         table.push(record("active", None));
         for i in 0..MAX_RECORDS + 100 {
             table.push(record(&format!("closed{i}"), Some(1)));
+            table.removed.clear();
         }
         assert_eq!(table.records.len(), MAX_RECORDS);
         assert!(table.get_mut("active").unwrap().active);
@@ -657,6 +740,68 @@ mod tests {
         assert!(table
             .get_mut(&format!("closed{}", MAX_RECORDS + 99))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn eviction_removes_logs_even_when_creation_is_delayed() {
+        for start_writer in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "neartrip-log-eviction-{}-{start_writer}.json",
+                std::process::id()
+            ));
+            let registry = Registry::new(&path);
+            let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+            registry.authenticated(&session.id);
+            registry.note_nmea(&session, "first fix");
+            let log = format!("logs/connections/{}.nmea.log", session.id);
+            if start_writer {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !Path::new(&log).exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            // With no await above, the current-thread writer has not started:
+            // eviction's first unlink happens before the async file creation.
+            registry.close(&session.id);
+            for i in 0..MAX_RECORDS {
+                registry.with_mut(|table| table.push(record(&format!("churn{i}"), Some(1))));
+            }
+            assert!(registry.with_mut(|table| table.get_mut(&session.id).is_none()));
+            // Keep the sender alive: eviction must wake and terminate the writer.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                session.nmea.get().unwrap().closed(),
+            )
+            .await
+            .unwrap();
+            assert!(!Path::new(&log).exists(), "orphaned log after eviction");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn capacity_eviction_updates_only_the_swapped_index() {
+        let mut table = SessionTable::default();
+        table.push(record("active", None));
+        for i in 0..MAX_RECORDS - 1 {
+            table.push(record(&format!("closed{i}"), Some(1)));
+        }
+        let untouched = table.by_id["closed1000"];
+        let allocation = table.records.as_ptr();
+        for i in 0..100 {
+            table.push(record(&format!("new{i}"), Some(1)));
+            table.removed.clear();
+        }
+        assert_eq!(table.records.as_ptr(), allocation);
+        assert_eq!(table.by_id["active"], 0);
+        assert_eq!(table.by_id["closed1000"], untouched);
+        for (id, index) in &table.by_id {
+            assert_eq!(&table.records[*index].id, id);
+        }
+        assert_eq!(table.closed.len(), MAX_RECORDS - 1);
     }
 
     #[tokio::test]
@@ -698,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_reindexes_surviving_sessions_and_preserves_active_ones() {
+    fn pruning_preserves_indices_and_active_sessions() {
         let mut table = SessionTable::default();
         table.push(record("expired", Some(1)));
         table.push(record("active", None));
@@ -707,8 +852,7 @@ mod tests {
         assert!(table.get_mut("expired").is_none());
         assert_eq!(table.by_id.len(), 2);
         table.get_mut("active").unwrap().bytes_sent = 42;
-        assert_eq!(table.records[0].id, "active");
-        assert_eq!(table.records[0].bytes_sent, 42);
+        assert_eq!(table.get_mut("active").unwrap().bytes_sent, 42);
         assert_eq!(table.get_mut("recent").unwrap().id, "recent");
         table.push(record("new", None));
         assert_eq!(table.get_mut("new").unwrap().id, "new");

@@ -126,3 +126,58 @@ async fn malformed_and_oversized_nmea_does_not_break_stream_or_valid_position_up
     let _ = std::fs::remove_file(format!("logs/connections/{id}.nmea.log"));
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn successful_rover_handshakes_release_pending_slots_before_banner() {
+    let (addr, registry, stop, task, path) = start("immediate-admission").await;
+    let mut clients = Vec::new();
+    // maxPendingPerIp is one: each next connection must work immediately,
+    // without waiting for the one-second policy interval.
+    for _ in 0..4 {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        banner(&mut client).await;
+        clients.push(client);
+    }
+    assert_eq!(
+        snapshot(&registry, &path).await.as_array().unwrap().len(),
+        4
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn publisher_handshakes_also_release_pending_slots_immediately() {
+    let config = Config::parse(r#"{"username":"r","password":"p","mountPoint":"NEAR","sources":[{"mountPoint":"BASE","username":"b","password":"s"}],"connectionLimits":{"maxConnections":3,"maxPendingHandshakes":1,"maxPendingPerIp":1}}"#).unwrap();
+    let (_cfg, configs) = watch::channel(config);
+    let (stop, shutdown) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "neartrip-publisher-admission-{}.json",
+        std::process::id()
+    ));
+    let task = tokio::spawn(serve(
+        listener,
+        configs,
+        Arc::new(Registry::new(&path)),
+        shutdown,
+    ));
+    let mut publisher = TcpStream::connect(addr).await.unwrap();
+    publisher
+        .write_all(b"SOURCE s /BASE\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = [0; 14];
+    timeout(Duration::from_secs(2), publisher.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"ICY 200 OK\r\n\r\n");
+    let mut rover = TcpStream::connect(addr).await.unwrap();
+    banner(&mut rover).await;
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+}

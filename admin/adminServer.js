@@ -46,6 +46,7 @@ function initAdminServer(options = {}) {
     } = options;
 
     const app = express();
+    const configWatcher = configManager.watchConfig?.();
 
     // Enable logging
     app.use(morgan('dev'));
@@ -92,7 +93,7 @@ function initAdminServer(options = {}) {
     // Run every 6 hours (4 times per day)
     const purgeTimer = setInterval(purgeOldConnections, 6 * 60 * 60 * 1000);
     purgeTimer.unref();
-    server.on('close', () => { clearInterval(purgeTimer); memberAccess.close?.(); });
+    server.on('close', () => { clearInterval(purgeTimer); memberAccess.close?.(); configWatcher?.close(); });
     logger.info(`Connection history purge scheduled every 6 hours (keeping ${CONNECTION_HISTORY_DAYS} days of history)`);
 
     return { app, server };

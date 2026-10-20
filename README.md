@@ -389,3 +389,9 @@ attempts are limited to 20 per TCP peer per five minutes. Member mutations requi
 a session CSRF token. Serve the dashboard through HTTPS. With TLS terminating at
 a reverse proxy, set `NEARTRIP_SECURE_COOKIES=true` on Node to require secure
 session cookies; forwarded identity/IP headers are not trusted automatically.
+
+Node observes disk configuration edits, atomic replacements, and symlink-target
+replacements every 250 ms, invalidating affected member sessions. Configuration
+reads also check for disk changes before returning data, preventing member
+mutations from overwriting disk edits with stale account settings.
+Unreadable or malformed configuration is rejected rather than replaced with defaults.

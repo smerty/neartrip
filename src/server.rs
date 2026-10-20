@@ -316,10 +316,22 @@ pub(crate) fn auth_matches(config: &Config, auth: Option<&(String, String)>) -> 
         return false;
     };
     if !config.users.is_empty() || !config.members.is_empty() {
+        let active_members: std::collections::HashSet<&str> = config
+            .members
+            .iter()
+            .filter(|member| member.active)
+            .map(|member| member.username.as_str())
+            .collect();
         return config.users.iter().fold(false, |matched, account| {
             let credentials_match = ct_eq(user.as_bytes(), account.username.as_bytes())
                 & ct_eq(pass.as_bytes(), account.password.as_bytes());
-            matched | (config.user_enabled(account) & credentials_match)
+            let enabled = account.active
+                && account
+                    .owner
+                    .as_deref()
+                    .map(|owner| active_members.contains(owner))
+                    .unwrap_or(true);
+            matched | (enabled & credentials_match)
         });
     }
     ct_eq(user.as_bytes(), config.username.as_bytes())
@@ -815,6 +827,33 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_account_authentication_handles_many_members_and_disabled_owners() {
+        let members: Vec<_> = (0..1000)
+            .map(|i| serde_json::json!({"username":format!("member{i}"), "active": i != 500}))
+            .collect();
+        let users: Vec<_> = (0..10000).map(|i| serde_json::json!({"username":format!("rover{i}"), "password":"secret", "owner":format!("member{}", i / 10)})).collect();
+        let config =
+            crate::Config::parse(&serde_json::json!({"members":members,"users":users}).to_string())
+                .unwrap();
+        assert!(!super::auth_matches(
+            &config,
+            Some(&("missing".into(), "wrong".into()))
+        ));
+        assert!(super::auth_matches(
+            &config,
+            Some(&("rover9999".into(), "secret".into()))
+        ));
+        assert!(!super::auth_matches(
+            &config,
+            Some(&("rover5000".into(), "secret".into()))
+        ));
+        assert!(!super::auth_matches(
+            &config,
+            Some(&("rover9999".into(), "wrong".into()))
+        ));
+    }
+
     use super::*;
 
     fn direct_link(receiver: tokio::sync::broadcast::Receiver<Vec<u8>>) -> Option<Upstream> {

@@ -6,7 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const management = require('../utils/management');
 
-function fixture() {
+function fixture({ diskWatch = false } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'neartrip-console-'));
     const configFile = path.join(dir, 'config.json');
     let config = {
@@ -19,8 +19,14 @@ function fixture() {
     let snapshot = { updatedAt: Date.now(), stats: { startedAt: Date.now(), clients: [{ key: 'login:private-rover' }], bases: [] },
         security: [{ ip: '192.0.2.44', authenticationFailures: 30 }] };
     const configListeners = new Set();
-    const configManager = { subscribeConfig(fn) { configListeners.add(fn); return () => configListeners.delete(fn); }, CONFIG_FILE_PATH: configFile, getConfig: () => config,
+    let configManager = { subscribeConfig(fn) { configListeners.add(fn); return () => configListeners.delete(fn); }, CONFIG_FILE_PATH: configFile, getConfig: () => config,
         reloadConfig() { config = JSON.parse(fs.readFileSync(configFile, 'utf8')); for (const fn of configListeners) fn(config); return config; } };
+    if (diskWatch) {
+        const configContext = vm.createContext({ __dirname: path.join(dir, 'utils'), module: { exports: {} },
+            require(name) { if (name === './logger') return { info() {}, error() {} }; return require(name); } });
+        vm.runInContext(fs.readFileSync(path.join(__dirname, '../utils/config.js'), 'utf8'), configContext);
+        configManager = configContext.module.exports;
+    }
     const context = vm.createContext({
         __dirname: path.resolve(__dirname, '../admin'), module: { exports: {} }, setInterval, clearInterval,
         require(name) {
@@ -38,7 +44,7 @@ function fixture() {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../admin/adminServer.js'), 'utf8'), context);
     const { server } = context.module.exports.initAdminServer({ port: 0, username: 'admin', password: 'console-secret' });
     return {
-        config: () => config, reload(config) { fs.writeFileSync(configFile, JSON.stringify(config)); configManager.reloadConfig(); }, setSnapshot(value) { snapshot = value; },
+        config: () => configManager.getConfig(), diskFile: configFile, onConfig: fn => configManager.subscribeConfig(fn), reload(config) { fs.writeFileSync(configFile, JSON.stringify(config)); configManager.reloadConfig(); }, setSnapshot(value) { snapshot = value; },
         async request(url, { auth = false, method = 'GET', body, cookie, csrf } = {}) {
             const headers = {};
             if (cookie) headers.Cookie = cookie;
@@ -222,4 +228,47 @@ test('native login submission cannot place named credentials in a GET URL', () =
     const form = html.match(/<form\b[^>]*id="loginForm"[^>]*>/)[0];
     assert.match(form, /method="post"/i);
     assert.match(form, /action="\/login"/i);
+});
+
+test('production watcher reloads disk edits and atomic replacements, invalidating cookies without an explicit reload', async () => {
+    const api = fixture({ diskWatch: true });
+    const login = async () => (await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).cookie;
+    let writePath = api.diskFile;
+    async function diskUpdate(config, atomic) {
+        let unsubscribe;
+        const observed = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => { unsubscribe(); reject(new Error('disk change not observed')); }, 3000);
+            unsubscribe = api.onConfig(() => { clearTimeout(timer); unsubscribe(); resolve(); });
+        });
+        if (atomic) { fs.writeFileSync(writePath + '.new', JSON.stringify(config)); fs.renameSync(writePath + '.new', writePath); }
+        else fs.writeFileSync(writePath, JSON.stringify(config));
+        await observed;
+    }
+    try {
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'long-member-password' } });
+        for (const mode of [false, true, true, 'symlink']) {
+            if (mode === 'symlink') {
+                writePath = api.diskFile + '.target';
+                fs.renameSync(api.diskFile, writePath); fs.symlinkSync(writePath, api.diskFile);
+            }
+            const atomic = mode !== false;
+            const cookie = await login(), config = JSON.parse(JSON.stringify(api.config()));
+            await diskUpdate({ ...config, members: config.members.map(m => ({ ...m, active: false })) }, atomic);
+            assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
+            assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).status, 401);
+            await diskUpdate(config, atomic);
+            assert.equal((await api.request('/api/member/me', { cookie })).status, 401, 're-enable cannot restore the old cookie');
+        }
+        // Synchronous reads also observe edits before the poll fires.
+        const cookie = await login(), config = JSON.parse(JSON.stringify(api.config()));
+        fs.writeFileSync(api.diskFile, JSON.stringify({ ...config, members: config.members.map(m => ({ ...m, active: false })) }));
+        assert.equal((await api.request('/api/member/rovers', { cookie, method: 'POST', csrf: 'unused', body: {} })).status, 401);
+        assert.equal(JSON.parse(fs.readFileSync(api.diskFile)).members[0].active, false);
+        fs.writeFileSync(api.diskFile, '{');
+        assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
+        assert.equal((await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).status, 400);
+        assert.equal(fs.readFileSync(api.diskFile, 'utf8'), '{', 'invalid config must not be replaced with defaults');
+        fs.writeFileSync(api.diskFile, JSON.stringify(config));
+        assert.equal((await api.request('/api/member/me', { cookie: await login() })).status, 200);
+    } finally { await api.close(); }
 });

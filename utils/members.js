@@ -38,7 +38,9 @@ function setupMembers(app, manager, save, admin) {
         const token = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('neartrip_session='))?.slice(17);
         const session = sessions.get(token);
         if (!session || session.until < Date.now()) { sessions.delete(token); return null; }
-        const member = (manager.getConfig().members || []).find(m => m.username === session.username && m.active && m.passwordHash === session.version);
+        let member;
+        try { member = (manager.getConfig().members || []).find(m => m.username === session.username && m.active && m.passwordHash === session.version); }
+        catch { sessions.delete(token); return null; }
         if (!member) { sessions.delete(token); return null; }
         return { member, token, csrf: session.csrf };
     };
@@ -80,8 +82,8 @@ function setupMembers(app, manager, save, admin) {
         const attempt = attempts.get(ip) || { count: 0, until: now + 300000 };
         attempts.set(ip, attempt);
         if (++attempt.count > 20) return res.status(429).json({ error: 'Too many login attempts. Try again in five minutes.' });
-        const m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active);
         try {
+            const m = (manager.getConfig().members || []).find(m => m.username === req.body?.username && m.active);
             // Also run the KDF for unknown accounts.
             const valid = await verify(req.body?.password, m?.passwordHash || '00000000000000000000000000000000:' + '0'.repeat(128));
             if (!m || !valid) return res.status(401).json({ error: 'Invalid login' });

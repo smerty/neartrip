@@ -27,6 +27,11 @@ const DEFAULT_CONFIG = {
 
 // Current configuration
 let currentConfig = null;
+let loadedPath = CONFIG_FILE_PATH, loadedStamp = null;
+function stamp(file) {
+    const s = fs.statSync(file, { bigint: true });
+    return `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+}
 const listeners = new Set();
 function publishConfig(config) {
     currentConfig = config;
@@ -54,22 +59,21 @@ function loadConfig(filePath = CONFIG_FILE_PATH) {
             }
             
             // Write default config to file
-            fs.writeFileSync(filePath, JSON.stringify(DEFAULT_CONFIG, null, 4));
+            fs.writeFileSync(filePath, JSON.stringify(DEFAULT_CONFIG, null, 4), { mode: 0o600 });
             logger.info(`Default configuration written to ${filePath}`);
             
             // Store and return the default config
+            loadedPath = filePath; loadedStamp = stamp(filePath);
             publishConfig({ ...DEFAULT_CONFIG });
             return currentConfig;
         }
         
-        // Clear the Node.js require cache for the config file
-        // This ensures we get a fresh copy of the file when it changes
-        if (require.cache[require.resolve(filePath)]) {
-            delete require.cache[require.resolve(filePath)];
-        }
-        
-        // Load the configuration
-        const config = require(filePath);
+        // Reading JSON directly also follows atomically replaced symlink targets.
+        const before = stamp(filePath);
+        const config = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (before !== stamp(filePath)) throw new Error('Configuration changed during read; retry');
+        loadedPath = filePath;
+        loadedStamp = before;
         logger.info(`Configuration loaded successfully from ${filePath}`);
         
         // Store as current config
@@ -78,15 +82,6 @@ function loadConfig(filePath = CONFIG_FILE_PATH) {
         return config;
     } catch (error) {
         logger.error(`Failed to load configuration from ${filePath}:`, error);
-        
-        // If we can't load the config file but it exists, it might be corrupted
-        if (fs.existsSync(filePath)) {
-            logger.warn(`Configuration file ${filePath} might be corrupted, using default configuration`);
-            
-            // We'll use the default config in memory but won't overwrite the file
-            publishConfig({ ...DEFAULT_CONFIG });
-            return currentConfig;
-        }
         
         throw new Error(`Could not load configuration file. Error: ${error.message}`);
     }
@@ -101,6 +96,9 @@ function getConfig() {
     if (!currentConfig) {
         return loadConfig();
     }
+    // Synchronize before reads/mutations too, so they cannot overwrite a disk
+    // edit during the interval before the watcher fires. Fail closed on bad JSON.
+    if (stamp(loadedPath) !== loadedStamp) return reloadConfig(loadedPath);
     return currentConfig;
 }
 
@@ -112,6 +110,7 @@ function getConfig() {
  * @throws {Error} If the configuration file cannot be loaded or parsed
  */
 function reloadConfig(filePath = CONFIG_FILE_PATH) {
+    if (!fs.existsSync(filePath)) throw new Error('Configuration file is unavailable');
     logger.info(`Reloading configuration from ${filePath}`);
     return loadConfig(filePath);
 }
@@ -121,33 +120,22 @@ function reloadConfig(filePath = CONFIG_FILE_PATH) {
  * 
  * @param {string} [filePath=CONFIG_FILE_PATH] - Path to the configuration file
  * @param {Function} [callback] - Optional callback function to call when config is reloaded
- * @returns {fs.FSWatcher} A file watcher instance
+ * @returns {{close: Function}} Watcher cleanup handle
  */
 function watchConfig(filePath = CONFIG_FILE_PATH, callback) {
     logger.info(`Setting up config file watch on ${filePath}`);
     
-    const watcher = fs.watch(filePath, { persistent: true }, (eventType) => {
-        if (eventType === 'change') {
-            logger.info(`Configuration file ${filePath} changed`);
-            
-            try {
-                const newConfig = reloadConfig(filePath);
-                
-                if (callback && typeof callback === 'function') {
-                    callback(newConfig);
-                }
-            } catch (error) {
-                logger.error('Error reloading configuration after file change:', error);
-                // Continue using previous configuration on error
-            }
-        }
-    });
-    
-    watcher.on('error', (error) => {
-        logger.error(`Error watching config file ${filePath}:`, error);
-    });
-    
-    return watcher;
+    // Poll the pathname, rather than a file inode: atomic replacement and
+    // replacement of a Docker/symlink target must continue to be observed.
+    const listener = () => {
+        try {
+            if (stamp(filePath) === loadedStamp) return;
+            const config = reloadConfig(filePath);
+            if (typeof callback === 'function') callback(config);
+        } catch (error) { logger.error('Error reloading configuration after file change:', error); }
+    };
+    fs.watchFile(filePath, { persistent: false, interval: 250 }, listener);
+    return { close() { fs.unwatchFile(filePath, listener); } };
 }
 
 // Initialize by loading the configuration

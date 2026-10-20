@@ -26,6 +26,12 @@ function validateMembers(c) {
 }
 function setupMembers(app, manager, save, admin) {
     const sessions = new Map(), attempts = new Map();
+    const invalidate = config => {
+        for (const [token, session] of sessions) {
+            if (!(config.members || []).some(m => m.username === session.username && m.active && m.passwordHash === session.version)) sessions.delete(token);
+        }
+    };
+    const unsubscribe = manager.subscribeConfig?.(invalidate);
     const root = path.join(__dirname, '..', 'web', 'public');
     const safe = m => ({ username: m.username, active: m.active });
     const current = req => {
@@ -33,7 +39,8 @@ function setupMembers(app, manager, save, admin) {
         const session = sessions.get(token);
         if (!session || session.until < Date.now()) { sessions.delete(token); return null; }
         const member = (manager.getConfig().members || []).find(m => m.username === session.username && m.active && m.passwordHash === session.version);
-        return member ? { member, token, csrf: session.csrf } : null;
+        if (!member) { sessions.delete(token); return null; }
+        return { member, token, csrf: session.csrf };
     };
     const adminMap = req => {
         if (!req.headers.authorization?.startsWith('Basic ')) return false;
@@ -114,7 +121,7 @@ function setupMembers(app, manager, save, admin) {
         try { save({ ...c, users: c.users.map(u => u === user ? updated : u) }); res.json({ username: updated.username, active: updated.active, ...(req.body?.rotate === true ? { password } : {}) }); }
         catch { res.status(400).json({ error: 'Unable to update rover' }); }
     });
-    return { guard, setupAdmin() {
+    return { guard, close() { unsubscribe?.(); }, setupAdmin() {
         app.get('/api/members', (_req, res) => res.json((manager.getConfig().members || []).map(safe)));
         const pending = new Set();
         const change = async (req, res, create) => {

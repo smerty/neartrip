@@ -220,8 +220,8 @@ async fn session(
                     let _ = client_write.shutdown().await;
                     return Err(body);
                 }
-                RequestAction::Stream(username) => {
-                    registry.authenticated_as(&live.id, username.as_deref());
+                RequestAction::Stream(auth) => {
+                    registry.authenticated_as(&live.id, auth.as_ref());
                     client_write
                         .write_all(b"ICY 200 OK\r\n\r\n")
                         .await
@@ -248,7 +248,7 @@ async fn session(
 enum RequestAction {
     Sourcetable,
     Reject(String),
-    Stream(Option<String>),
+    Stream(Option<(String, String)>),
 }
 
 fn dispatch_request(head: &str, configs: &watch::Receiver<Config>) -> RequestAction {
@@ -267,7 +267,7 @@ fn dispatch_request(head: &str, configs: &watch::Receiver<Config>) -> RequestAct
         return RequestAction::Reject("HTTP/1.1 401 Unauthorized\r\n\r\n".into());
     }
     RequestAction::Stream(if config.requires_auth() {
-        request.auth.map(|a| a.0)
+        request.auth
     } else {
         None
     })

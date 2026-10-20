@@ -18,8 +18,9 @@ function fixture() {
     fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
     let snapshot = { updatedAt: Date.now(), stats: { startedAt: Date.now(), clients: [{ key: 'login:private-rover' }], bases: [] },
         security: [{ ip: '192.0.2.44', authenticationFailures: 30 }] };
-    const configManager = { CONFIG_FILE_PATH: configFile, getConfig: () => config,
-        reloadConfig() { config = JSON.parse(fs.readFileSync(configFile, 'utf8')); return config; } };
+    const configListeners = new Set();
+    const configManager = { subscribeConfig(fn) { configListeners.add(fn); return () => configListeners.delete(fn); }, CONFIG_FILE_PATH: configFile, getConfig: () => config,
+        reloadConfig() { config = JSON.parse(fs.readFileSync(configFile, 'utf8')); for (const fn of configListeners) fn(config); return config; } };
     const context = vm.createContext({
         __dirname: path.resolve(__dirname, '../admin'), module: { exports: {} }, setInterval, clearInterval,
         require(name) {
@@ -37,7 +38,7 @@ function fixture() {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../admin/adminServer.js'), 'utf8'), context);
     const { server } = context.module.exports.initAdminServer({ port: 0, username: 'admin', password: 'console-secret' });
     return {
-        config: () => config, setSnapshot(value) { snapshot = value; },
+        config: () => config, reload(config) { fs.writeFileSync(configFile, JSON.stringify(config)); configManager.reloadConfig(); }, setSnapshot(value) { snapshot = value; },
         async request(url, { auth = false, method = 'GET', body, cookie, csrf } = {}) {
             const headers = {};
             if (cookie) headers.Cookie = cookie;
@@ -175,5 +176,27 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         const freshCsrf = (await api.request('/api/member/me', { cookie: fresh.cookie })).body.csrf;
         await api.request('/api/member/logout', { cookie: fresh.cookie, csrf: freshCsrf, method: 'POST', body: {} });
         assert.equal((await api.request('/api/member/me', { cookie: fresh.cookie })).status, 401);
+    } finally { await api.close(); }
+});
+
+test('settings saves and disk reloads permanently invalidate member cookies across disable and re-enable', async () => {
+    const api = fixture(), admin = (method, body) => ({ auth: true, method, body });
+    const login = async () => (await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'long-member-password' } })).cookie;
+    try {
+        await api.request('/api/members', admin('POST', { username: 'alice', password: 'long-member-password' }));
+        for (const method of ['settings', 'reload']) {
+            // Test both a cookie used while disabled and one not used until after re-enable.
+            const used = await login(), unused = await login();
+            const update = async active => {
+                const config = { ...api.config(), members: api.config().members.map(m => ({ ...m, active })) };
+                if (method === 'settings') assert.equal((await api.request('/api/config', admin('PUT', config))).status, 200);
+                else api.reload(config);
+            };
+            await update(false);
+            assert.equal((await api.request('/api/member/me', { cookie: used })).status, 401);
+            await update(true);
+            for (const cookie of [used, unused]) assert.equal((await api.request('/api/member/me', { cookie })).status, 401, method);
+            assert.equal((await api.request('/api/member/me', { cookie: await login() })).status, 200);
+        }
     } finally { await api.close(); }
 });

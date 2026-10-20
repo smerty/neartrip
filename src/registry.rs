@@ -41,6 +41,8 @@ struct SessionRecord {
     authenticated: bool,
     role: String,
     username: Option<String>,
+    #[serde(skip)]
+    credential: Option<String>,
     upstream_status: String,
     last_upstream_error: Option<String>,
     last_gga_at: Option<String>,
@@ -318,19 +320,21 @@ impl Registry {
         }
         match session.username.as_ref() {
             Some(name) => {
-                !(config
-                    .users
-                    .iter()
-                    .any(|u| &u.username == name && config.user_enabled(u))
-                    || (config.users.is_empty()
-                        && config.members.is_empty()
-                        && &config.username == name))
+                !(config.users.iter().any(|u| {
+                    &u.username == name
+                        && config.user_enabled(u)
+                        && session.credential.as_ref() == Some(&u.password)
+                }) || (config.users.is_empty()
+                    && config.members.is_empty()
+                    && &config.username == name
+                    && session.credential.as_ref() == Some(&config.password)))
             }
             None => config.requires_auth(),
         }
     }
 
-    pub fn authenticated_as(&self, id: &str, username: Option<&str>) {
+    pub fn authenticated_as(&self, id: &str, auth: Option<&(String, String)>) {
+        let username = auth.map(|a| a.0.as_str());
         let identity = self.with_mut(|sessions| {
             let session = sessions.get_mut(id)?;
             if session.authenticated {
@@ -339,6 +343,7 @@ impl Registry {
             session.authenticated = true;
             session.role = "rover".into();
             session.username = username.map(str::to_string);
+            session.credential = auth.map(|a| a.1.clone());
             session.status = "awaiting_gga".into();
             Some(session.client_ip.clone())
         });

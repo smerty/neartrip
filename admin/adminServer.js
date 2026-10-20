@@ -92,7 +92,7 @@ function initAdminServer(options = {}) {
     // Run every 6 hours (4 times per day)
     const purgeTimer = setInterval(purgeOldConnections, 6 * 60 * 60 * 1000);
     purgeTimer.unref();
-    server.on('close', () => clearInterval(purgeTimer));
+    server.on('close', () => { clearInterval(purgeTimer); memberAccess.close?.(); });
     logger.info(`Connection history purge scheduled every 6 hours (keeping ${CONNECTION_HISTORY_DAYS} days of history)`);
 
     return { app, server };

@@ -7,6 +7,10 @@
     function select(station) {
         selected = NetworkMap.key(station);
         map?.focusStation(station);
+        renderDetail(station);
+        for (const [key, row] of rows) row.button.setAttribute('aria-pressed', String(key === selected));
+    }
+    function renderDetail(station) {
         const detail = el('stationDetail'); detail.replaceChildren(); detail.hidden = false;
         const title = document.createElement('strong'); title.textContent = station.mountPoint; detail.appendChild(title);
         const text = document.createElement('div');
@@ -15,7 +19,6 @@
         if (station.ellipsoidalHeightM != null) {
             const height = document.createElement('div'); height.textContent = station.ellipsoidalHeightM.toFixed(2) + ' m above the ellipsoid'; detail.appendChild(height);
         }
-        for (const [key, row] of rows) row.button.setAttribute('aria-pressed', String(key === selected));
     }
     function render() {
         const query = el('stationSearch').value.toLowerCase().trim();
@@ -55,6 +58,8 @@
         el('readyBases').textContent = stations.filter(ready).length;
         el('settlingBases').textContent = stations.filter(onboarding).length;
         map?.setStations(visible);
+        const station = stations.find(s => NetworkMap.key(s) === selected);
+        if (station) renderDetail(station);
     }
     async function load() {
         if (loading) return; loading = true;

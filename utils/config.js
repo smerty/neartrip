@@ -27,6 +27,12 @@ const DEFAULT_CONFIG = {
 
 // Current configuration
 let currentConfig = null;
+const listeners = new Set();
+function publishConfig(config) {
+    currentConfig = config;
+    for (const listener of listeners) listener(config);
+}
+function subscribeConfig(listener) { listeners.add(listener); return () => listeners.delete(listener); }
 
 /**
  * Load configuration from file
@@ -52,7 +58,7 @@ function loadConfig(filePath = CONFIG_FILE_PATH) {
             logger.info(`Default configuration written to ${filePath}`);
             
             // Store and return the default config
-            currentConfig = { ...DEFAULT_CONFIG };
+            publishConfig({ ...DEFAULT_CONFIG });
             return currentConfig;
         }
         
@@ -67,7 +73,7 @@ function loadConfig(filePath = CONFIG_FILE_PATH) {
         logger.info(`Configuration loaded successfully from ${filePath}`);
         
         // Store as current config
-        currentConfig = config;
+        publishConfig(config);
         
         return config;
     } catch (error) {
@@ -78,7 +84,7 @@ function loadConfig(filePath = CONFIG_FILE_PATH) {
             logger.warn(`Configuration file ${filePath} might be corrupted, using default configuration`);
             
             // We'll use the default config in memory but won't overwrite the file
-            currentConfig = { ...DEFAULT_CONFIG };
+            publishConfig({ ...DEFAULT_CONFIG });
             return currentConfig;
         }
         
@@ -153,6 +159,7 @@ try {
 }
 
 module.exports = {
+    subscribeConfig,
     loadConfig,
     getConfig,
     reloadConfig,

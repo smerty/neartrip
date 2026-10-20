@@ -371,7 +371,8 @@ registration. Dashboard passwords use salted scrypt hashes, separate from NTRIP
 passwords. Members sign in at `/login`, view stations, and use **My rover
 credentials** (`/rovers`) to create up to ten credentials, rotate generated
 passwords, or enable/disable individual rovers. Generated passwords are displayed
-once. Ownership is assigned on the server; members cannot inspect other members'
+once. Rotation disconnects existing rover streams within approximately one second
+of configuration reload; clients must reconnect using the new password. Ownership is assigned on the server; members cannot inspect other members'
 credentials or reach admin APIs.
 
 Disabling a member immediately invalidates dashboard sessions and blocks their

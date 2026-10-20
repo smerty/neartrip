@@ -734,3 +734,73 @@ async fn disabling_member_revokes_live_rovers_but_preserves_publisher_and_other_
     task.await.unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn rotating_password_closes_fixed_and_nearest_rovers_without_exposing_credentials() {
+    let config = Config::parse(r#"{"mountPoint":"NEAR","users":[{"username":"a","password":"old"}],"sources":[{"mountPoint":"BASE","username":"base","password":"pw","latitude":37,"longitude":-122,"settlingSeconds":0}]}"#).unwrap();
+    let (cfg, configs) = watch::channel(config.clone());
+    let (stop, shutdown) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = std::env::temp_dir().join(format!("neartrip-rotation-{}", std::process::id()));
+    let registry = Arc::new(Registry::new(dir.join("sessions.json")));
+    let task = tokio::spawn(serve(listener, configs, registry.clone(), shutdown));
+    let (mut source, _) = request(addr, "SOURCE pw /BASE\r\n\r\n").await;
+    source.write_all(b"INITIAL").await.unwrap();
+    let (mut fixed, _) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YTpvbGQ=\r\n\r\n",
+    )
+    .await;
+    let (mut nearest, _) = request(
+        addr,
+        "GET /NEAR HTTP/1.0\r\nAuthorization: Basic YTpvbGQ=\r\n\r\n",
+    )
+    .await;
+    let gga =
+        neartrip::nmea::with_checksum("$GPGGA,123519,3700.0000,N,12200.0000,W,1,12,1.0,0,M,0,M,,");
+    nearest
+        .write_all(format!("{gga}\r\n").as_bytes())
+        .await
+        .unwrap();
+    // Keep the source live while waiting for nearest selection to subscribe.
+    for _ in 0..10 {
+        source.write_all(b"X").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let mut byte = [0];
+    timeout(Duration::from_secs(2), nearest.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(byte, *b"X");
+    let mut rotated = config.clone();
+    rotated.users[0].password = "new".into();
+    cfg.send(rotated).unwrap();
+    for rover in [&mut fixed, &mut nearest] {
+        let mut tail = Vec::new();
+        timeout(Duration::from_secs(3), rover.read_to_end(&mut tail))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let (_, response) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YTpvbGQ=\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("401"));
+    let (_, response) = request(
+        addr,
+        "GET /BASE HTTP/1.0\r\nAuthorization: Basic YTpuZXc=\r\n\r\n",
+    )
+    .await;
+    assert!(response.contains("200"));
+    registry.flush();
+    assert!(!std::fs::read_to_string(dir.join("sessions.json"))
+        .unwrap()
+        .contains("credential"));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

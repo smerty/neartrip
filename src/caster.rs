@@ -453,7 +453,7 @@ pub async fn route(
         registry.authenticated_as(
             &live.id,
             if config.requires_auth() {
-                auth.as_ref().map(|a| a.0.as_str())
+                auth.as_ref()
             } else {
                 None
             },

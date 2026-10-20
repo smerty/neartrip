@@ -38,7 +38,9 @@ class LoginLimiter {
             if (!value) {
                 value = { failures: 0, next: 0, until: now + 300000, pending: 0 };
                 this.entries.set(key, value);
-            } else if (value.until <= now && value.pending === 0) {
+            } else if (value.until <= now) {
+                // Renew the failure window even if older checks are in flight.
+                // Keep pending intact so pinned entries remain safe from eviction.
                 value.failures = 0;
                 value.next = 0;
                 value.until = now + 300000;

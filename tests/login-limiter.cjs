@@ -108,3 +108,33 @@ test('a full budget table evicts idle tracking instead of denying unrelated corr
     assert.ok(limiter.entries.size <= 10000);
     inFlight.forEach(a => a.finish(true));
 });
+
+test('expired IP budgets renew while overlapping checks keep the entry pinned', () => {
+    let now = 0;
+    const limiter = new LoginLimiter(() => now);
+    const options = { knownAccount: false };
+    let held = limiter.begin('192.0.2.1', 'old', options);
+    now = 300001;
+    let rolling = limiter.begin('192.0.2.1', 'new', options);
+    let blockedAt;
+    for (let i = 1; i <= 200; i++) {
+        held.finish(false);
+        held = rolling;
+        const next = limiter.begin('192.0.2.1', 'guess' + i, options);
+        if (!next.finish) {
+            blockedAt = i;
+            assert.equal(next.retryAfter, 300);
+            break;
+        }
+        rolling = next;
+    }
+    assert.equal(blockedAt, 100, 'overlapping checks must not bypass the renewed failure budget');
+    held.finish(false);
+    assert.equal(limiter.busy, 0);
+    assert.equal(limiter.entries.get('ip:192.0.2.1').pending, 0);
+    limiter.begin('192.0.2.2', 'unrelated-member').finish(true);
+    now += 300001;
+    const recovered = limiter.begin('192.0.2.1', 'member', options);
+    assert.ok(recovered.finish);
+    recovered.finish(true);
+});

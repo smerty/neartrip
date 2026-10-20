@@ -121,7 +121,12 @@ pub async fn serve_with_hub(
                                 tokio::select! {
                                     _ = shutdown.changed() => break "core shutdown".to_string(),
                                     _ = tokio::time::sleep_until(deadline), if lease.is_pending() => {
-                                        break "handshake timeout".to_string();
+                                        // select! guards are evaluated on entry, not when
+                                        // the timer fires. Authentication may have completed
+                                        // while the streaming future remained pending.
+                                        if lease.is_pending() {
+                                            break "handshake timeout".to_string();
+                                        }
                                     }
                                     _ = policy_tick.tick() => {
                                         if registry.rover_revoked(&live.id, &policy_configs.borrow()) {

@@ -181,3 +181,44 @@ async fn publisher_handshakes_also_release_pending_slots_immediately() {
     task.await.unwrap();
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn delayed_successful_handshakes_survive_the_original_deadline() {
+    for publishing in [false, true] {
+        let config = Config::parse(r#"{"username":"r","password":"p","mountPoint":"NEAR","sources":[{"mountPoint":"BASE","username":"b","password":"s"}],"connectionLimits":{"maxConnections":3,"maxPendingHandshakes":1,"maxPendingPerIp":1,"handshakeTimeoutSeconds":1}}"#).unwrap();
+        let (_cfg, configs) = watch::channel(config);
+        let (stop, shutdown) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "neartrip-delayed-auth-{}-{publishing}.json",
+            std::process::id()
+        ));
+        let registry = Arc::new(Registry::new(&path));
+        let task = tokio::spawn(serve(listener, configs, registry.clone(), shutdown));
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Let the select arm its deadline while the socket is unauthenticated.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        if publishing {
+            client.write_all(b"SOURCE s /BASE\r\n\r\n").await.unwrap();
+            let mut response = [0; 14];
+            timeout(Duration::from_secs(2), client.read_exact(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&response, b"ICY 200 OK\r\n\r\n");
+        } else {
+            banner(&mut client).await;
+        }
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let records = snapshot(&registry, &path).await;
+        assert_eq!(records[0]["active"], true, "successful handshake was disconnected at its old deadline (publishing={publishing}): {records}");
+        assert_eq!(
+            records[0]["role"],
+            if publishing { "publisher" } else { "rover" }
+        );
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+}

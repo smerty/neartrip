@@ -1,10 +1,13 @@
 //! Live session table written to `logs/sessions.json` for the admin UI.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,10 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 
+const MAX_RECORDS: usize = 16384;
+const MAX_LOG_BYTES: usize = 1024 * 1024;
+// Also bound detached writers draining queues after rapid authenticated reconnects.
+static NMEA_WRITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8192);
 const HISTORY_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -50,6 +57,10 @@ struct SessionRecord {
     read_idle_timeout_secs: u64,
     #[serde(skip)]
     disconnected_unix: Option<u64>,
+    #[serde(skip)]
+    log_state: Arc<LogState>,
+    #[serde(skip)]
+    pending: Option<crate::admission::Pending>,
 }
 
 pub struct Registry {
@@ -65,10 +76,22 @@ pub struct Registry {
 struct SessionTable {
     records: Vec<SessionRecord>,
     by_id: HashMap<String, usize>,
+    closed: VecDeque<String>,
+    removed: Vec<SessionRecord>,
 }
 
 impl SessionTable {
     fn push(&mut self, record: SessionRecord) {
+        // Closed IDs form an eviction queue; swap removal updates only the moved
+        // record's index. Connection churn never shifts/reindexes the table.
+        if self.records.len() >= MAX_RECORDS {
+            if let Some(id) = self.closed.pop_front() {
+                self.remove(&id);
+            }
+        }
+        if !record.active {
+            self.closed.push_back(record.id.clone());
+        }
         self.by_id.insert(record.id.clone(), self.records.len());
         self.records.push(record);
     }
@@ -78,25 +101,70 @@ impl SessionTable {
         self.records.get_mut(index)
     }
 
-    fn prune(&mut self, now: u64) {
-        let previous_len = self.records.len();
-        self.records
-            .retain(|session| match session.disconnected_unix {
-                Some(then) => now.saturating_sub(then) < HISTORY_SECS,
-                None => true,
-            });
-        if self.records.len() != previous_len {
-            self.by_id.clear();
-            for (index, session) in self.records.iter().enumerate() {
-                self.by_id.insert(session.id.clone(), index);
-            }
+    fn remove(&mut self, id: &str) {
+        let Some(index) = self.by_id.remove(id) else {
+            return;
+        };
+        let removed = self.records.swap_remove(index);
+        if let Some(moved) = self.records.get(index) {
+            *self.by_id.get_mut(&moved.id).expect("indexed session") = index;
         }
+        removed.log_state.evicted.store(true, Ordering::Release);
+        removed.log_state.changed.notify_one();
+        self.removed.push(removed);
+    }
+
+    fn prune(&mut self, now: u64) {
+        let expired: Vec<_> = self
+            .records
+            .iter()
+            .filter(|s| {
+                s.disconnected_unix
+                    .is_some_and(|then| now.saturating_sub(then) >= HISTORY_SECS)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in expired {
+            self.remove(&id);
+        }
+        self.closed.retain(|id| self.by_id.contains_key(id));
+    }
+}
+
+#[derive(Default)]
+struct LogState {
+    evicted: AtomicBool,
+    changed: Notify,
+}
+
+// Eviction may occur before, during, or after asynchronous file creation.
+// The eviction path removes existing files; the writer removes late-created ones.
+struct LogCleanup {
+    state: Arc<LogState>,
+    path: String,
+}
+impl Drop for LogCleanup {
+    fn drop(&mut self) {
+        if self.state.evicted.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+// Never trust a pathname loaded from a historical JSON file.
+fn remove_nmea_log(record: &SessionRecord) {
+    if record.id.len() == 32
+        && record.id.bytes().all(|b| b.is_ascii_hexdigit())
+        && record.nmea_log_file == format!("logs/connections/{}.nmea.log", record.id)
+    {
+        let _ = fs::remove_file(&record.nmea_log_file);
     }
 }
 
 pub struct LiveSession {
     pub(crate) id: String,
-    nmea: mpsc::Sender<String>,
+    nmea: OnceLock<mpsc::Sender<String>>,
+    log_state: Arc<LogState>,
 }
 
 impl Registry {
@@ -184,36 +252,30 @@ impl Registry {
     }
 
     pub async fn open(&self, peer: SocketAddr) -> LiveSession {
+        self.open_inner(peer, None)
+    }
+
+    pub(crate) fn open_admitted(
+        &self,
+        peer: SocketAddr,
+        pending: crate::admission::Pending,
+    ) -> LiveSession {
+        self.open_inner(peer, Some(pending))
+    }
+
+    fn open_inner(
+        &self,
+        peer: SocketAddr,
+        pending: Option<crate::admission::Pending>,
+    ) -> LiveSession {
         let id = session_id();
-        // This relative path is what the admin UI opens. The process working
-        // directory is the application root, so the write lands in the same place.
-        let nmea_log_file = format!("logs/connections/{id}.nmea.log");
-        let log_path = nmea_log_file.clone();
-        let (tx, mut rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            let _ = tokio::fs::create_dir_all("logs/connections").await;
-            let mut file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await
-            {
-                Ok(file) => file,
-                Err(err) => {
-                    tracing::warn!(%err, path = %log_path, "nmea log unavailable");
-                    return;
-                }
-            };
-            while let Some(line) = rx.recv().await {
-                if file.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let log_state = Arc::new(LogState::default());
         let (now, _) = now_unix();
         self.with_mut(|sessions| {
             sessions.push(SessionRecord {
                 id: id.clone(),
+                log_state: log_state.clone(),
+                pending,
                 client_ip: display_ip(peer),
                 client_port: peer.port(),
                 connected_at: now,
@@ -226,7 +288,7 @@ impl Registry {
                 current_station: None,
                 bytes_sent: 0,
                 bytes_received: 0,
-                nmea_log_file,
+                nmea_log_file: String::new(),
                 status: "tcp_connected".into(),
                 upstream_status: "disconnected".into(),
                 read_idle_timeout_secs: 120,
@@ -235,7 +297,11 @@ impl Registry {
             });
         });
         self.changed.notify_one();
-        LiveSession { id, nmea: tx }
+        LiveSession {
+            id,
+            nmea: OnceLock::new(),
+            log_state,
+        }
     }
 
     pub fn publisher(&self, id: &str) {
@@ -243,6 +309,9 @@ impl Registry {
             let session = sessions.get_mut(id)?;
             if session.role == "publisher" {
                 return None;
+            }
+            if let Some(pending) = session.pending.take() {
+                pending.release();
             }
             session.role = "publisher".into();
             session.status = "publishing".into();
@@ -299,11 +368,73 @@ impl Registry {
     }
 
     pub fn note_nmea(&self, session: &LiveSession, sentence: &str) {
-        let _ = session.nmea.try_send(format!("{sentence}\n"));
+        if sentence.len() > 1024 {
+            return;
+        }
+        // No per-socket log task or file until an authenticated rover emits NMEA.
+        let sender = session.nmea.get_or_init(|| {
+            let (tx, mut rx) = mpsc::channel::<String>(64);
+            let Ok(permit) = NMEA_WRITERS.try_acquire() else {
+                return tx;
+            };
+            let log_path = format!("logs/connections/{}.nmea.log", session.id);
+            self.with_mut(|sessions| {
+                if let Some(record) = sessions.get_mut(&session.id) {
+                    record.nmea_log_file = log_path.clone();
+                }
+            });
+            let state = session.log_state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let cleanup = LogCleanup {
+                    state,
+                    path: log_path.clone(),
+                };
+                let mut options = OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                options.mode(0o600);
+                let mut file = match options.open(&log_path).await {
+                    Ok(file) => file,
+                    Err(err) => {
+                        tracing::warn!(%err, "nmea log unavailable");
+                        return;
+                    }
+                };
+                let mut written = 0;
+                loop {
+                    if cleanup.state.evicted.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let line = tokio::select! {
+                        _ = cleanup.state.changed.notified() => continue,
+                        line = rx.recv() => match line { Some(line) => line, None => break },
+                    };
+                    if written + line.len() > MAX_LOG_BYTES {
+                        break;
+                    }
+                    if file.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    written += line.len();
+                }
+                let _ = file.flush().await;
+            });
+            tx
+        });
+        let _ = sender.try_send(format!("{sentence}\n"));
     }
 
     pub fn authenticated(&self, id: &str) {
         self.authenticated_as(id, None);
+    }
+
+    pub fn accepted(&self, id: &str) -> bool {
+        self.with_mut(|sessions| {
+            sessions
+                .get_mut(id)
+                .is_some_and(|session| session.authenticated || session.role == "publisher")
+        })
     }
 
     pub fn rover_revoked(&self, id: &str, config: &crate::config::Config) -> bool {
@@ -339,6 +470,9 @@ impl Registry {
             let session = sessions.get_mut(id)?;
             if session.authenticated {
                 return None;
+            }
+            if let Some(pending) = session.pending.take() {
+                pending.release();
             }
             session.authenticated = true;
             session.role = "rover".into();
@@ -395,17 +529,22 @@ impl Registry {
         self.stats.close(id, crate::caster::now_ms());
         self.with_mut(|sessions| {
             if let Some(session) = sessions.get_mut(id) {
+                if !session.active {
+                    return;
+                }
                 if session.active && (session.authenticated || session.role == "publisher") {
                     if let Ok(ip) = session.client_ip.parse() {
                         self.security.closed(ip);
                     }
                 }
                 session.active = false;
+                session.credential = None;
                 session.status = "disconnected".into();
                 session.upstream_status = "disconnected".into();
                 session.disconnect_reason = Some(reason.into());
                 session.disconnected_at = Some(stamp);
                 session.disconnected_unix = Some(unix);
+                sessions.closed.push_back(id.to_owned());
             }
         });
         self.changed.notify_one();
@@ -445,7 +584,14 @@ impl Registry {
 
     fn with_mut<T>(&self, f: impl FnOnce(&mut SessionTable) -> T) -> T {
         let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        f(&mut guard)
+        let result = f(&mut guard);
+        let removed = std::mem::take(&mut guard.removed);
+        drop(guard);
+        // Filesystem work must not hold the mutex used by live rover updates.
+        for record in removed {
+            remove_nmea_log(&record);
+        }
+        result
     }
 }
 
@@ -581,7 +727,123 @@ mod tests {
     }
 
     #[test]
-    fn pruning_reindexes_surviving_sessions_and_preserves_active_ones() {
+    fn connection_churn_caps_history_without_evicting_active_sessions() {
+        let mut table = SessionTable::default();
+        table.push(record("active", None));
+        for i in 0..MAX_RECORDS + 100 {
+            table.push(record(&format!("closed{i}"), Some(1)));
+            table.removed.clear();
+        }
+        assert_eq!(table.records.len(), MAX_RECORDS);
+        assert!(table.get_mut("active").unwrap().active);
+        assert!(table.get_mut("closed0").is_none());
+        assert!(table
+            .get_mut(&format!("closed{}", MAX_RECORDS + 99))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn eviction_removes_logs_even_when_creation_is_delayed() {
+        for start_writer in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "neartrip-log-eviction-{}-{start_writer}.json",
+                std::process::id()
+            ));
+            let registry = Registry::new(&path);
+            let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+            registry.authenticated(&session.id);
+            registry.note_nmea(&session, "first fix");
+            let log = format!("logs/connections/{}.nmea.log", session.id);
+            if start_writer {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !Path::new(&log).exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            // With no await above, the current-thread writer has not started:
+            // eviction's first unlink happens before the async file creation.
+            registry.close(&session.id);
+            for i in 0..MAX_RECORDS {
+                registry.with_mut(|table| table.push(record(&format!("churn{i}"), Some(1))));
+            }
+            assert!(registry.with_mut(|table| table.get_mut(&session.id).is_none()));
+            // Keep the sender alive: eviction must wake and terminate the writer.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                session.nmea.get().unwrap().closed(),
+            )
+            .await
+            .unwrap();
+            assert!(!Path::new(&log).exists(), "orphaned log after eviction");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn capacity_eviction_updates_only_the_swapped_index() {
+        let mut table = SessionTable::default();
+        table.push(record("active", None));
+        for i in 0..MAX_RECORDS - 1 {
+            table.push(record(&format!("closed{i}"), Some(1)));
+        }
+        let untouched = table.by_id["closed1000"];
+        let allocation = table.records.as_ptr();
+        for i in 0..100 {
+            table.push(record(&format!("new{i}"), Some(1)));
+            table.removed.clear();
+        }
+        assert_eq!(table.records.as_ptr(), allocation);
+        assert_eq!(table.by_id["active"], 0);
+        assert_eq!(table.by_id["closed1000"], untouched);
+        for (id, index) in &table.by_id {
+            assert_eq!(&table.records[*index].id, id);
+        }
+        assert_eq!(table.closed.len(), MAX_RECORDS - 1);
+    }
+
+    #[tokio::test]
+    async fn nmea_log_size_and_expiration_are_bounded() {
+        let path =
+            std::env::temp_dir().join(format!("neartrip-log-limit-{}.json", std::process::id()));
+        let registry = Registry::new(&path);
+        let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+        registry.authenticated(&session.id);
+        registry.note_nmea(&session, "first");
+        let sender = session.nmea.get().unwrap();
+        for _ in 0..1100 {
+            if sender.send("x".repeat(1023) + "\n").await.is_err() {
+                break;
+            }
+        }
+        let log = format!("logs/connections/{}.nmea.log", session.id);
+        let size = std::fs::metadata(&log).unwrap().len();
+        assert!(size <= MAX_LOG_BYTES as u64);
+        assert!(size > (MAX_LOG_BYTES - 1024) as u64);
+        registry.close(&session.id);
+        registry.with_mut(|sessions| {
+            sessions.get_mut(&session.id).unwrap().disconnected_unix = Some(0)
+        });
+        registry.flush();
+        assert!(!Path::new(&log).exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connections_do_not_create_nmea_files() {
+        let path =
+            std::env::temp_dir().join(format!("neartrip-no-log-{}.json", std::process::id()));
+        let registry = Registry::new(&path);
+        let session = registry.open("192.0.2.1:1234".parse().unwrap()).await;
+        assert!(!Path::new(&format!("logs/connections/{}.nmea.log", session.id)).exists());
+        assert!(session.nmea.get().is_none());
+        registry.close(&session.id);
+    }
+
+    #[test]
+    fn pruning_preserves_indices_and_active_sessions() {
         let mut table = SessionTable::default();
         table.push(record("expired", Some(1)));
         table.push(record("active", None));
@@ -590,8 +852,7 @@ mod tests {
         assert!(table.get_mut("expired").is_none());
         assert_eq!(table.by_id.len(), 2);
         table.get_mut("active").unwrap().bytes_sent = 42;
-        assert_eq!(table.records[0].id, "active");
-        assert_eq!(table.records[0].bytes_sent, 42);
+        assert_eq!(table.get_mut("active").unwrap().bytes_sent, 42);
         assert_eq!(table.get_mut("recent").unwrap().id, "recent");
         table.push(record("new", None));
         assert_eq!(table.get_mut("new").unwrap().id, "new");

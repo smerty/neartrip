@@ -221,7 +221,12 @@ impl Security {
         }
     }
     pub fn closed(&self, ip: IpAddr) {
-        if let Some(entry) = self.entries.lock().unwrap().get_mut(&canonical(ip)) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&canonical(ip))
+        {
             entry.active_authenticated = entry.active_authenticated.saturating_sub(1);
         }
     }

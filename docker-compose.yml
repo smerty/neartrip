@@ -6,6 +6,9 @@ services:
     build: .
     ports:
       - "2101:2101"  # Direct exposure of NTRIP port
+    environment:
+      # Set to the Traefik container IP or a dedicated proxy-only subnet.
+      NEARTRIP_TRUSTED_PROXIES: ${NEARTRIP_TRUSTED_PROXIES:-}
     volumes:
       - config:/app/config
       - logs:/app/logs

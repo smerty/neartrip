@@ -42,11 +42,13 @@ function fixture({ diskWatch = false } = {}) {
         process,
     });
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../admin/adminServer.js'), 'utf8'), context);
-    const { server } = context.module.exports.initAdminServer({ port: 0, username: 'admin', password: 'console-secret' });
+    const { app, server } = context.module.exports.initAdminServer({ port: 0, username: 'admin', password: 'console-secret' });
     return {
+        proxyTrust: () => app.get('trust proxy'),
         config: () => configManager.getConfig(), diskFile: configFile, onConfig: fn => configManager.subscribeConfig(fn), reload(config) { fs.writeFileSync(configFile, JSON.stringify(config)); configManager.reloadConfig(); }, setSnapshot(value) { snapshot = value; },
-        async request(url, { auth = false, method = 'GET', body, cookie, csrf } = {}) {
+        async request(url, { auth = false, method = 'GET', body, cookie, csrf, forwarded } = {}) {
             const headers = {};
+            if (forwarded) headers['X-Forwarded-For'] = forwarded;
             if (cookie) headers.Cookie = cookie;
             if (csrf) headers['X-CSRF-Token'] = csrf;
             if (auth) headers.Authorization = 'Basic ' + Buffer.from('admin:console-secret').toString('base64');
@@ -163,6 +165,8 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         assert.equal((await api.request('/api/member/rovers', { cookie, method: 'POST', body: {} })).status, 403);
         const rover = await api.request('/api/member/rovers', { cookie, csrf, method: 'POST', body: { owner: 'bob' } });
         assert.equal(rover.status, 201); assert.equal(api.config().users[0].owner, 'alice'); assert.ok(rover.body.password);
+        assert.match(rover.body.username, /^rover-[a-f0-9]{8}$/);
+        assert.match(rover.body.password, /^[A-Za-z0-9_-]{12}$/);
         const list = await api.request('/api/member/rovers', { cookie }); assert.equal(list.body.users[0].password, undefined);
         const bob = await api.request('/api/member/login', { method: 'POST', body: { username: 'bob', password: 'another-long-password' } });
         const bobCsrf = (await api.request('/api/member/me', { cookie: bob.cookie })).body.csrf;
@@ -170,6 +174,8 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         assert.equal((await api.request('/api/member/rovers/' + rover.body.username, { cookie: bob.cookie, csrf: bobCsrf, method: 'PUT', body: { rotate: true } })).status, 404);
         const rotated = await api.request('/api/member/rovers/' + rover.body.username, { cookie, csrf, method: 'PUT', body: { rotate: true } });
         assert.notEqual(rotated.body.password, rover.body.password);
+        assert.match(rotated.body.password, /^[A-Za-z0-9_-]{12}$/);
+        assert.equal(rotated.body.username, rover.body.username);
         await api.request('/api/members/alice', admin('PUT', { active: false }));
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
         assert.equal((await api.request('/api/public/stations', { cookie })).status, 401);
@@ -271,4 +277,62 @@ test('production watcher reloads disk edits and atomic replacements, invalidatin
         fs.writeFileSync(api.diskFile, JSON.stringify(config));
         assert.equal((await api.request('/api/member/me', { cookie: await login() })).status, 200);
     } finally { await api.close(); }
+});
+
+
+test('trusted proxy clients have independent login budgets and untrusted forwarding cannot spoof IPs', async () => {
+    const saved = process.env.NEARTRIP_TRUSTED_PROXIES;
+    const run = async mode => {
+        const trusted = mode === 'trusted';
+        if (trusted) process.env.NEARTRIP_TRUSTED_PROXIES = '127.0.0.1/32';
+        else if (mode === 'empty') process.env.NEARTRIP_TRUSTED_PROXIES = '';
+        else delete process.env.NEARTRIP_TRUSTED_PROXIES;
+        const api = fixture();
+        try {
+            assert.equal(typeof api.proxyTrust(), trusted ? 'function' : 'boolean');
+            if (!trusted) assert.equal(api.proxyTrust(), false, 'forwarded headers stay untrusted by default');
+            await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+            // Invalid passwords skip the KDF; unique account names isolate IP budgeting.
+            for (let i = 0; i < 100; i++) {
+                const result = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.1', body: { username: 'unknown' + i } });
+                assert.equal(result.status, 401);
+            }
+            const login = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.2', body: { username: 'alice', password: 'member-audit-password' } });
+            assert.equal(login.status, 200, 'unset proxy trust must not block every member behind a shared peer');
+            if (!trusted) {
+                // Hostile forwarding headers remain ignored without proxy trust.
+                const ordinary = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+                assert.equal(ordinary.status, 200);
+            }
+            if (trusted) {
+                // A forged leftmost address cannot bypass the first untrusted hop.
+                const forged = await api.request('/api/member/login', { method: 'POST', forwarded: '192.0.2.99, 192.0.2.1', body: { username: 'alice', password: 'member-audit-password' } });
+                assert.equal(forged.status, 429);
+            }
+        } finally { await api.close(); }
+    };
+    try { await run('trusted'); await run('unset'); await run('empty'); }
+    finally {
+        if (saved === undefined) delete process.env.NEARTRIP_TRUSTED_PROXIES;
+        else process.env.NEARTRIP_TRUSTED_PROXIES = saved;
+    }
+});
+
+test('ten thousand unknown usernames cannot deny a valid member login without proxy configuration', async () => {
+    const saved = process.env.NEARTRIP_TRUSTED_PROXIES;
+    delete process.env.NEARTRIP_TRUSTED_PROXIES;
+    const api = fixture();
+    try {
+        await api.request('/api/members', { auth: true, method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        for (let i = 0; i < 10000; i++) {
+            const result = await api.request('/api/member/login', { method: 'POST', body: { username: 'unknown' + i } });
+            assert.equal(result.status, 401);
+        }
+        const login = await api.request('/api/member/login', { method: 'POST', body: { username: 'alice', password: 'member-audit-password' } });
+        assert.equal(login.status, 200);
+    } finally {
+        await api.close();
+        if (saved === undefined) delete process.env.NEARTRIP_TRUSTED_PROXIES;
+        else process.env.NEARTRIP_TRUSTED_PROXIES = saved;
+    }
 });

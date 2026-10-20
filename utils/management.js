@@ -22,6 +22,15 @@ function policy(config) {
     return { ...raw, allowlistedIps: [...raw.allowlistedIps], permanentBans: [...raw.permanentBans], temporaryBans: [...raw.temporaryBans] };
 }
 function validateManagement(config) {
+    if (config.connectionLimits !== undefined) {
+        const raw = config.connectionLimits;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 'Invalid caster connection limits';
+        const limits = { maxConnections: 4096, maxPendingHandshakes: 256, maxPendingPerIp: 32, handshakeTimeoutSeconds: 10, ...raw };
+        if (![limits.maxConnections, limits.maxPendingHandshakes, limits.maxPendingPerIp, limits.handshakeTimeoutSeconds].every(Number.isInteger) ||
+            limits.maxConnections < 1 || limits.maxConnections > 8192 || limits.maxPendingHandshakes < 1 || limits.maxPendingHandshakes > 1024 ||
+            limits.maxPendingHandshakes > limits.maxConnections || limits.maxPendingPerIp < 1 || limits.maxPendingPerIp > limits.maxPendingHandshakes ||
+            limits.handshakeTimeoutSeconds < 1 || limits.handshakeTimeoutSeconds > 60) return 'Invalid caster connection limits';
+    }
     const memberError = validateMembers(config); if (memberError) return memberError;
     if (config.users !== undefined && !Array.isArray(config.users)) return 'Users must be an array';
     const usernames = new Set();

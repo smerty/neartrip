@@ -163,6 +163,8 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         assert.equal((await api.request('/api/member/rovers', { cookie, method: 'POST', body: {} })).status, 403);
         const rover = await api.request('/api/member/rovers', { cookie, csrf, method: 'POST', body: { owner: 'bob' } });
         assert.equal(rover.status, 201); assert.equal(api.config().users[0].owner, 'alice'); assert.ok(rover.body.password);
+        assert.match(rover.body.username, /^rover-[a-f0-9]{8}$/);
+        assert.match(rover.body.password, /^[A-Za-z0-9_-]{12}$/);
         const list = await api.request('/api/member/rovers', { cookie }); assert.equal(list.body.users[0].password, undefined);
         const bob = await api.request('/api/member/login', { method: 'POST', body: { username: 'bob', password: 'another-long-password' } });
         const bobCsrf = (await api.request('/api/member/me', { cookie: bob.cookie })).body.csrf;
@@ -170,6 +172,8 @@ test('members own rover credentials, cannot reach admin data, and lose sessions 
         assert.equal((await api.request('/api/member/rovers/' + rover.body.username, { cookie: bob.cookie, csrf: bobCsrf, method: 'PUT', body: { rotate: true } })).status, 404);
         const rotated = await api.request('/api/member/rovers/' + rover.body.username, { cookie, csrf, method: 'PUT', body: { rotate: true } });
         assert.notEqual(rotated.body.password, rover.body.password);
+        assert.match(rotated.body.password, /^[A-Za-z0-9_-]{12}$/);
+        assert.equal(rotated.body.username, rover.body.username);
         await api.request('/api/members/alice', admin('PUT', { active: false }));
         assert.equal((await api.request('/api/member/me', { cookie })).status, 401);
         assert.equal((await api.request('/api/public/stations', { cookie })).status, 401);

@@ -110,7 +110,10 @@ function setupMembers(app, manager, save, admin) {
     app.post('/api/member/rovers', (req, res) => {
         const c = manager.getConfig(), owner = req.memberSession.member.username;
         if ((c.users || []).filter(u => u.owner === owner).length >= 10) return res.status(400).json({ error: 'Maximum ten rover credentials per member' });
-        const username = 'rover-' + crypto.randomBytes(12).toString('hex'), password = crypto.randomBytes(24).toString('base64url');
+        let username;
+        do { username = 'rover-' + crypto.randomBytes(4).toString('hex'); }
+        while ((c.users || []).some(u => u.username === username));
+        const password = crypto.randomBytes(9).toString('base64url');
         try { save({ ...c, users: [...(c.users || []), { username, password, owner, active: true }] }); res.status(201).json({ username, password }); }
         catch { res.status(400).json({ error: 'Unable to create rover credentials' }); }
     });
@@ -118,7 +121,7 @@ function setupMembers(app, manager, save, admin) {
         const c = manager.getConfig(), owner = req.memberSession.member.username;
         const user = (c.users || []).find(u => u.username === req.params.username && u.owner === owner);
         if (!user) return res.status(404).json({ error: 'Rover not found' });
-        const password = crypto.randomBytes(24).toString('base64url');
+        const password = crypto.randomBytes(9).toString('base64url');
         const updated = { ...user, ...(req.body?.rotate === true ? { password } : {}), ...(typeof req.body?.active === 'boolean' ? { active: req.body.active } : {}) };
         try { save({ ...c, users: c.users.map(u => u === user ? updated : u) }); res.json({ username: updated.username, active: updated.active, ...(req.body?.rotate === true ? { password } : {}) }); }
         catch { res.status(400).json({ error: 'Unable to update rover' }); }

@@ -74,6 +74,8 @@ function adminApi(coreRecords) {
             };
             if (name === '../utils/logger') return { info() {}, debug() {}, error() {} };
             if (name === '../utils/config') return {};
+            if (name === '../utils/members') return { setupMembers() { return { guard(_req, _res, next) { next(); }, setupAdmin() {} }; } };
+            if (name === '../utils/management') return require('../utils/management');
             if (name === '../utils/sources') return require('../utils/sources');
             throw new Error(`Unexpected dependency: ${name}`);
         },

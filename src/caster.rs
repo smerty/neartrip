@@ -411,6 +411,7 @@ pub async fn route(
                 let initial = body.take(rest);
                 if !initial.is_empty() {
                     hub.publish(source.unwrap(), initial);
+                    registry.publisher_bytes(&live.id, initial.len());
                 }
                 if body.complete() { return Err("source body complete".into()); }
                 let mut buf = [0u8; 4096];
@@ -434,7 +435,7 @@ pub async fn route(
                     deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                     registry.add_bytes(&live.id, 0, n as u64);
                     let payload = body.take(&buf[..n]);
-                    if !payload.is_empty() { hub.publish(source.unwrap(), payload); }
+                    if !payload.is_empty() { hub.publish(source.unwrap(), payload); registry.publisher_bytes(&live.id, payload.len()); }
                     if body.complete() { return Err("source body complete".into()); }
                 }
             }.await;
@@ -449,7 +450,14 @@ pub async fn route(
         let Some(mut rx) = receiver else {
             return Some(reject(write, "503 Service Unavailable").await);
         };
-        registry.authenticated(&live.id);
+        registry.authenticated_as(
+            &live.id,
+            if config.requires_auth() {
+                auth.as_ref()
+            } else {
+                None
+            },
+        );
         registry.station(&live.id, mount);
         registry.upstream(&live.id, "connected", None);
         let mut live_configs = configs.clone();

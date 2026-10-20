@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in · NearTRIP</title>
+    <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+    <main>
+        <h1>NearTRIP</h1>
+        <h2>Sign in</h2>
+        <form id="loginForm" method="post" action="/login">
+            <label for="username">Username</label>
+            <input id="username" name="username" autocomplete="username" required maxlength="64">
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+            <button type="submit">Sign in</button>
+        </form>
+        <p id="message" role="status"></p>
+        <p class="help">Need an account? Contact your network administrator.</p>
+        <footer><a href="/admin">Admin sign in</a></footer>
+    </main>
+    <script src="/member-auth.js"></script>
+</body>
+</html>

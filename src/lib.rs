@@ -8,8 +8,10 @@ pub mod nmea;
 pub mod onboarding;
 pub mod registry;
 pub mod rtcm;
+pub mod security;
 pub mod server;
 pub mod sourcetable;
+pub mod stats;
 pub mod upstream;
 
 pub use config::Config;

@@ -14,6 +14,8 @@ pub struct Config {
     pub password: String,
     #[serde(default)]
     pub users: Vec<User>,
+    #[serde(default)]
+    pub members: Vec<Member>,
     #[serde(default = "default_interface")]
     pub interface: String,
     #[serde(default = "default_port")]
@@ -26,6 +28,8 @@ pub struct Config {
     pub stations: Vec<Station>,
     #[serde(default)]
     pub sources: Vec<Source>,
+    #[serde(default)]
+    pub security: crate::security::Policy,
 }
 
 /// Rover accounts. A nonempty list replaces the legacy shared credentials.
@@ -34,6 +38,14 @@ pub struct User {
     pub username: String,
     pub password: String,
     #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Member {
+    pub username: String,
     pub active: bool,
 }
 
@@ -106,7 +118,48 @@ impl Config {
         Ok(config)
     }
 
+    pub fn user_enabled(&self, user: &User) -> bool {
+        user.active
+            && user
+                .owner
+                .as_ref()
+                .map(|owner| {
+                    self.members
+                        .iter()
+                        .any(|m| &m.username == owner && m.active)
+                })
+                .unwrap_or(true)
+    }
+
     fn validate(&self) -> Result<(), String> {
+        self.security.validate()?;
+        let mut member_names = std::collections::HashSet::new();
+        for member in &self.members {
+            if member.username.is_empty() || !member_names.insert(&member.username) {
+                return Err("invalid or duplicate member".into());
+            }
+        }
+        let mut usernames = std::collections::HashSet::new();
+        for user in &self.users {
+            if user
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !member_names.contains(owner))
+                || user.username.is_empty()
+                || user.username.len() > 64
+                || matches!(user.username.as_str(), "." | "..")
+                || !user
+                    .username
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.@".contains(&b))
+                || user.password.is_empty()
+                || user.password.len() > 256
+                || !usernames.insert(&user.username)
+            {
+                return Err("invalid or duplicate rover account".into());
+            }
+        }
+
         let mut mounts = std::collections::HashSet::new();
         mounts.insert(self.mount_point.as_str());
         for station in &self.stations {
@@ -158,7 +211,10 @@ impl Config {
     }
 
     pub fn requires_auth(&self) -> bool {
-        !self.users.is_empty() || !self.username.is_empty() || !self.password.is_empty()
+        !self.members.is_empty()
+            || !self.users.is_empty()
+            || !self.username.is_empty()
+            || !self.password.is_empty()
     }
 }
 

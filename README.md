@@ -324,3 +324,74 @@ Existing upstream station support remains available during migration.
 Run `cargo test` and `npm run test:admin` for the source health, fan-out,
 nearest switching, onboarding admission/movement/recovery, stale-source
 failover/recovery, and admin API regressions.
+
+### Member directory and private administration
+
+`/` is a members-only station directory and map. Unauthenticated visitors go
+to `/login`; station metadata APIs require authentication too. `/admin` retains HTTP Basic Auth and
+adds rover **Users**, **Statistics**, and **IP policy** pages. Map tiles use
+OpenStreetMap; the map and fonts require internet access.
+
+Create rover credentials in Users. Enabled accounts take precedence over the
+legacy shared credentials; disabled accounts cannot authenticate. The UI prevents
+removing the last account because an empty account list restores legacy shared
+credentials (or anonymous access when those credentials are empty). Disabling or removing a rover account disconnects its sessions within roughly one second. Admin HTTP
+credentials and direct publisher credentials remain separate.
+
+Statistics aggregate direct-base uploads by mountpoint and rover downloads by
+verified login, or peer IP for anonymous clients. Session counts, bytes, and
+connection time are process-local and reset when the Rust core restarts. Each
+category retains up to 10,000 identities, evicting inactive identities when full.
+The core writes a private, atomic `logs/operations.json` snapshot every second
+(`NEARTRIP_OPERATIONS` overrides it for both Node and the core; relative paths
+resolve from the Node launch directory); the admin API rejects snapshots older than
+five seconds. These snapshots are never restored into memory.
+
+Automatic soft bans are **off by default**. When enabled, the defaults require
+20 authentication failures within five minutes and ban for ten minutes.
+Malformed requests and ordinary disconnects alone do not trigger a ban.
+Loopback, allowlisted addresses, active authenticated peers, and peers with a
+successful authentication in the preceding 30 minutes are exempt from automatic
+bans. Manual temporary/permanent bans override these exemptions. Ban checks use
+the TCP peer address, so shared NAT or a TCP proxy can group multiple users under
+one IP; allowlist trusted proxies before enabling automation.
+
+Manual bans and policy settings are saved in configuration. Automatic bans and
+activity counters reset on core restart. A manual ban closes existing NTRIP
+connections within approximately one second and blocks new ones; it does not
+block the admin HTTP interface. The IP page offers explicit unban and automatic
+ban exemption controls. Deploy both the updated Rust binary and Node admin
+server, then restart them to enable these features.
+
+
+### Member accounts and rover self-service
+
+Administrators create member accounts under **Users → Members**, supplying a
+username and a dashboard password (at least 12 characters). There is no public
+registration. Dashboard passwords use salted scrypt hashes, separate from NTRIP
+passwords. Members sign in at `/login`, view stations, and use **My rover
+credentials** (`/rovers`) to create up to ten credentials, rotate generated
+passwords, or enable/disable individual rovers. Generated passwords are displayed
+once. Rotation disconnects existing rover streams within approximately one second
+of configuration reload; clients must reconnect using the new password. Ownership is assigned on the server; members cannot inspect other members'
+credentials or reach admin APIs.
+
+Disabling a member immediately invalidates dashboard sessions and blocks their
+rover credentials. Existing rover sockets close on the core's next policy check
+(approximately one second after configuration reload). Re-enabling restores
+credentials that remain individually enabled; the member must sign in again.
+Once any member is configured, legacy shared/anonymous fallback is disabled;
+existing standalone rover accounts remain valid but are not assigned to a member
+automatically. Existing publishers are unaffected by member changes.
+
+Dashboard sessions expire after eight hours and reset when Node restarts. Login
+attempts are limited to 20 per TCP peer per five minutes. Member mutations require
+a session CSRF token. Serve the dashboard through HTTPS. With TLS terminating at
+a reverse proxy, set `NEARTRIP_SECURE_COOKIES=true` on Node to require secure
+session cookies; forwarded identity/IP headers are not trusted automatically.
+
+Node observes disk configuration edits, atomic replacements, and symlink-target
+replacements every 250 ms, invalidating affected member sessions. Configuration
+reads also check for disk changes before returning data, preventing member
+mutations from overwriting disk edits with stale account settings.
+Unreadable or malformed configuration is rejected rather than replaced with defaults.

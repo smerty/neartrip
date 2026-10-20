@@ -43,7 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
 });
 
-const PAGES = ['home', 'stations', 'connections', 'map', 'settings'];
+const PAGES = ['home', 'stations', 'connections', 'map', 'users', 'statistics', 'security', 'settings'];
 
 /**
  * Load the appropriate tab based on the URL hash
@@ -55,7 +55,7 @@ function loadTabFromUrlHash() {
         history.replaceState(null, '', '#stations');
     }
 
-    document.querySelectorAll('#stations, #connections, #map, #settings').forEach(section => {
+    document.querySelectorAll('#stations, #connections, #map, #users, #statistics, #security, #settings').forEach(section => {
         section.style.display = 'none';
     });
 
@@ -74,7 +74,7 @@ function loadTabFromUrlHash() {
     if (hash === 'map' && map) {
         setTimeout(() => {
             map.invalidateSize();
-            updateMap();
+            updateMap().then(() => { if (!atlasShown) { stationAtlas?.fit(); atlasShown = true; } });
         }, 100);
     }
 
@@ -261,7 +261,7 @@ async function loadConnections() {
                 <td>${conn.clientIp}</td>
                 <td>${formatTimestamp(conn.connectedAt)}</td>
                 <td>${conn.disconnectedAt ? formatTimestamp(conn.disconnectedAt) : '-'}</td>
-                <td>${conn.currentStation || '-'}</td>
+                <td>${escapeHtml(conn.currentStation || '-')}</td>
                 <td>${conn.latitude != null ? conn.latitude.toFixed(6) : '-'}</td>
                 <td>${conn.longitude != null ? conn.longitude.toFixed(6) : '-'}</td>
                 <td>${getFixQualityText(conn.fixQuality)}</td>
@@ -288,6 +288,7 @@ async function loadConnections() {
     
     // Update map with new client positions if map is initialized
     if (map) {
+        updateStationMarkers();
         updateClientMarkers();
     }
 }
@@ -384,154 +385,36 @@ function formatTimestamp(timestamp) {
 /**
  * Initialize the map
  */
+let stationAtlas;
+let atlasShown = false;
 function initMap() {
-    // Create a map centered around a default location
-    map = L.map('mapContainer').setView([37.7749, -122.4194], 5);
-    
-    // Add the OpenStreetMap tile layer
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-    }).addTo(map);
-    
-    // Update the map with station and client markers
-    updateMap();
-}
-
-/**
- * Update the map with all markers
- */
-function updateMap() {
-    updateStationMarkers();
-    updateClientMarkers();
-}
-
-/**
- * Update the station markers on the map
- */
-async function updateStationMarkers() {
     try {
-        const response = await fetch('/api/stations');
-        if (!response.ok) throw new Error('Failed to fetch stations');
-        
-        const stations = await response.json();
-        
-        // Clear existing station markers
-        stationMarkers.forEach(marker => marker.remove());
-        stationMarkers = [];
-        
-        // Add markers for each station
-        stations.forEach(station => {            
-            if (station.latitude && station.longitude) {
-                // Use default Leaflet marker but customize the icon
-                const markerIcon = L.icon({
-                    iconUrl: station.active ? 
-                        'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-green.png' : 
-                        'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
-                    shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
-                    iconSize: [25, 41],
-                    iconAnchor: [12, 41],
-                    popupAnchor: [1, -34],
-                    shadowSize: [41, 41]
-                });
-                
-                  const marker = L.marker([station.latitude, station.longitude], {
-                    icon: markerIcon
-                }).addTo(map);
-                
-                // Only add range rings for active stations
-                if (station.active) {
-                    // Add 10km green circle around station
-                    const circle10km = L.circle([station.latitude, station.longitude], {
-                        color: 'green',
-                        fillColor: '#3f3',
-                        fillOpacity: 0.1,
-                        radius: 10000 // 10km in meters
-                    }).addTo(map);
-                    
-                    // Add 20km orange circle around station
-                    const circle20km = L.circle([station.latitude, station.longitude], {
-                        color: 'orange',
-                        fillColor: '#fa3',
-                        fillOpacity: 0.1,
-                        radius: 20000 // 20km in meters
-                    }).addTo(map);
-                    
-                    // Store circles for later removal
-                    stationMarkers.push(circle10km);
-                    stationMarkers.push(circle20km);
-                }
-                  marker.bindPopup(`
-                    <strong>${station.mountPoint}</strong><br>
-                    ${station.casterHost}:${station.casterPort}<br>
-                    Status: ${station.active ? 'Active' : 'Inactive'}
-                `);
-                
-                // Store marker for later removal
-                stationMarkers.push(marker);
-            }
-        });
-    } catch (error) {
-        console.error('Error updating station markers:', error);
-    }
+        stationAtlas = new NetworkMap('mapContainer', { admin: true });
+        map = stationAtlas.map;
+        document.getElementById('fitAdminNetwork').addEventListener('click', () => stationAtlas.fit());
+        updateMap();
+    } catch (error) { console.error('Map unavailable:', error); }
 }
-
-/**
- * Update the client markers on the map
- */
+async function updateMap() {
+    await Promise.all([updateStationMarkers(), updateClientMarkers()]);
+}
+async function updateStationMarkers() {
+    if (!stationAtlas) return;
+    try {
+        const response = await fetch('/api/public/stations');
+        if (!response.ok) throw new Error('Station map unavailable');
+        stationAtlas.setStations(await response.json());
+    } catch (error) { console.error(error); }
+}
 async function updateClientMarkers() {
+    if (!stationAtlas) return;
     try {
         const response = await fetch('/api/connections');
-        if (!response.ok) throw new Error('Failed to fetch connections');
-        
-        const connections = await response.json();
-        
-        // Clear existing client markers
-        clientMarkers.forEach(marker => marker.remove());
-        clientMarkers = [];
-        
-        // Add markers for each client
-        connections.forEach(conn => {
-            if (conn.latitude && conn.longitude) {
-                // Use a blue marker for clients
-                const clientIcon = L.icon({
-                    iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
-                    shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
-                    iconSize: [25, 41],
-                    iconAnchor: [12, 41],
-                    popupAnchor: [1, -34],
-                    shadowSize: [41, 41]
-                });
-                
-                const marker = L.marker([conn.latitude, conn.longitude], {
-                    icon: clientIcon
-                }).addTo(map);
-                
-                // Include fix quality and satellites in the popup
-                marker.bindPopup(`
-                    <strong>Client ID:</strong> ${conn.id.substring(0, 8)}...<br>
-                    <strong>IP:</strong> ${conn.clientIp}<br>
-                    <strong>Current Station:</strong> ${conn.currentStation || '-'}<br>
-                    <strong>Fix Quality:</strong> ${getFixQualityText(conn.fixQuality)}<br>
-                    <strong>Satellites:</strong> ${conn.numSatellites !== undefined ? conn.numSatellites : '-'}<br>
-                    <strong>Data Sent:</strong> ${formatBytes(conn.bytesSent)}<br>
-                    <strong>Data Received:</strong> ${formatBytes(conn.bytesReceived)}
-                `);
-                
-                clientMarkers.push(marker);
-            }
-        });
-    } catch (error) {
-        console.error('Error updating client markers:', error);
-    }
+        if (!response.ok) throw new Error('Client map unavailable');
+        stationAtlas.setClients(await response.json());
+    } catch (error) { console.error(error); }
 }
 
-/**
- * Update server info without refreshing the config editor
- * 
- * This function refreshes just the server status information
- * without reloading the config editor to avoid disrupting any
- * edits a user might be making.
- */
 async function updateServerInfoWithoutConfigRefresh() {
     try {
         const response = await fetch('/api/info');

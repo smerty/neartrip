@@ -572,6 +572,7 @@ function editStation(station) {
     document.getElementById('stationPassword').value = station.password || '';
     document.getElementById('stationLatitude').value = station.latitude;
     document.getElementById('stationLongitude').value = station.longitude;
+    document.getElementById('stationActive').checked = station.active !== false;
     
     // Store original mount point for reference in case it changes
     document.getElementById('originalMountPoint').value = station.mountPoint;
@@ -595,7 +596,8 @@ async function saveStation() {
             username: document.getElementById('stationUsername').value,
             password: document.getElementById('stationPassword').value,
             latitude: parseFloat(document.getElementById('stationLatitude').value),
-            longitude: parseFloat(document.getElementById('stationLongitude').value)
+            longitude: parseFloat(document.getElementById('stationLongitude').value),
+            active: document.getElementById('stationActive').checked
         };
         
         // Validate required fields

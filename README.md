@@ -479,3 +479,8 @@ replacements every 250 ms, invalidating affected member sessions. Configuration
 reads also check for disk changes before returning data, preventing member
 mutations from overwriting disk edits with stale account settings.
 Unreadable or malformed configuration is rejected rather than replaced with defaults.
+
+## Related Projects
+
+[RusTK-caster](https://github.com/smerty/RusTK-caster) is a simple, robust way
+to send NTRIP data without standing up a heavier stack such as RTKBase.

@@ -32,6 +32,23 @@ pub struct Config {
     pub sources: Vec<Source>,
     #[serde(default)]
     pub security: crate::security::Policy,
+    /// Optional NTRIPS (TLS) listener. When omitted, only plain `port` is bound.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// In-process TLS for NTRIP publishers and clients on a dedicated port.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    #[serde(default = "default_tls_port")]
+    pub port: u16,
+    pub cert_file: String,
+    pub key_file: String,
+}
+
+fn default_tls_port() -> u16 {
+    2102
 }
 
 /// Rover accounts. A nonempty list replaces the legacy shared credentials.
@@ -136,6 +153,17 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         self.security.validate()?;
         self.connection_limits.validate()?;
+        if let Some(tls) = &self.tls {
+            if tls.port == 0 {
+                return Err("tls.port must be non-zero".into());
+            }
+            if tls.port == self.port {
+                return Err("tls.port must differ from the plain NTRIP port".into());
+            }
+            if tls.cert_file.is_empty() || tls.key_file.is_empty() {
+                return Err("tls.certFile and tls.keyFile are required when tls is set".into());
+            }
+        }
         let mut member_names = std::collections::HashSet::new();
         for member in &self.members {
             if member.username.is_empty() || !member_names.insert(&member.username) {
@@ -278,6 +306,15 @@ mod tests {
         assert_eq!(config.mount_point, "NEAR");
         assert!(config.stations[0].active);
         assert_eq!(config.port, 2101);
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn validates_tls_port_and_paths() {
+        let ok = r#"{"tls":{"port":2102,"certFile":"/c.pem","keyFile":"/k.pem"}}"#;
+        assert_eq!(Config::parse(ok).unwrap().tls.unwrap().port, 2102);
+        assert!(Config::parse(r#"{"port":2101,"tls":{"port":2101,"certFile":"/c.pem","keyFile":"/k.pem"}}"#).is_err());
+        assert!(Config::parse(r#"{"tls":{"port":2102,"certFile":"","keyFile":"/k.pem"}}"#).is_err());
     }
 
     #[test]

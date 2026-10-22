@@ -5,9 +5,9 @@ use crate::{
     server::{auth_matches, ct_eq, decode_basic},
 };
 use std::{collections::HashMap, sync::Mutex, time::Duration};
+use crate::server::{ClientRead, ClientWrite};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::{broadcast, watch},
 };
 
@@ -303,8 +303,8 @@ pub async fn route(
     rest: &[u8],
     configs: &watch::Receiver<Config>,
     hub: &Hub,
-    read: &mut OwnedReadHalf,
-    write: &mut OwnedWriteHalf,
+    read: &mut ClientRead,
+    write: &mut ClientWrite,
     registry: &Registry,
     live: &LiveSession,
 ) -> Option<Result<(), String>> {
@@ -486,7 +486,7 @@ pub async fn route(
         }.await)
     }
 }
-async fn reject(write: &mut OwnedWriteHalf, status: &str) -> Result<(), String> {
+async fn reject(write: &mut ClientWrite, status: &str) -> Result<(), String> {
     let _ = write
         .write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes())
         .await;

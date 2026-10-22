@@ -35,6 +35,31 @@ async fn main() {
             eprintln!("could not bind {}:{}: {err}", config.interface, config.port);
             std::process::exit(1);
         });
+    let tls = match &config.tls {
+        Some(tls) => {
+            let acceptor = neartrip::tls::ReloadingAcceptor::load(&tls.cert_file, &tls.key_file)
+                .unwrap_or_else(|err| {
+                    eprintln!("could not load TLS certs: {err}");
+                    std::process::exit(1);
+                });
+            let tls_listener = TcpListener::bind((config.interface.as_str(), tls.port))
+                .await
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "could not bind TLS {}:{}: {err}",
+                        config.interface, tls.port
+                    );
+                    std::process::exit(1);
+                });
+            info!(
+                addr = %tls_listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                cert = %tls.cert_file,
+                "NearTRIP NTRIPS listening"
+            );
+            Some((tls_listener, Arc::new(acceptor)))
+        }
+        None => None,
+    };
     let sessions_path = env::var("NEARTRIP_SESSIONS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("logs/sessions.json"));
@@ -135,7 +160,7 @@ async fn main() {
         }
         let _ = tokio::fs::remove_file(operations_path).await;
     });
-    serve_with_hub(listener, config_rx, registry.clone(), shutdown_rx, hub).await;
+    serve_with_hub(listener, tls, config_rx, registry.clone(), shutdown_rx, hub).await;
     let _ = health_task.await;
     let _ = operations_task.await;
     registry.flush();

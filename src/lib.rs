@@ -13,6 +13,7 @@ pub mod security;
 pub mod server;
 pub mod sourcetable;
 pub mod stats;
+pub mod tls;
 pub mod upstream;
 
 pub use config::Config;

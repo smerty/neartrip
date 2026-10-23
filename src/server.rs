@@ -7,7 +7,9 @@ use tokio::time::Instant;
 use base64::Engine;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+#[cfg(test)]
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 /// Client-facing connection after optional TLS handshake.
@@ -172,15 +174,28 @@ pub async fn serve_with_hub(
                             let deadline = Instant::now()
                                 + Duration::from_secs(limits.handshake_timeout_seconds);
                             let tls_timeout = Duration::from_secs(limits.handshake_timeout_seconds);
-                            let tls_stream = match tokio::time::timeout(tls_timeout, acceptor.accept(socket)).await {
-                                Ok(Ok(stream)) => stream,
-                                Ok(Err(err)) => {
-                                    cleanup.finish(&format!("TLS handshake failed: {err}"));
+                            if *shutdown.borrow() {
+                                cleanup.finish("core shutdown");
+                                return;
+                            }
+                            // Race shutdown so a silent TLS peer cannot delay JoinSet drain.
+                            let tls_stream = tokio::select! {
+                                _ = shutdown.changed() => {
+                                    cleanup.finish("core shutdown");
                                     return;
                                 }
-                                Err(_) => {
-                                    cleanup.finish("TLS handshake timeout");
-                                    return;
+                                result = tokio::time::timeout(tls_timeout, acceptor.accept(socket)) => {
+                                    match result {
+                                        Ok(Ok(stream)) => stream,
+                                        Ok(Err(err)) => {
+                                            cleanup.finish(&format!("TLS handshake failed: {err}"));
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            cleanup.finish("TLS handshake timeout");
+                                            return;
+                                        }
+                                    }
                                 }
                             };
                             let policy_configs = configs.clone();

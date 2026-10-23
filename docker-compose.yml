@@ -4,11 +4,13 @@ version: '3.8'
 # Traefik only needs 80/443 for the admin UI. Publishers connect to host:2102.
 #
 # Recommended cert path (no port 443, works without Traefik):
+#   cp .env.ntrips.example .env.ntrips   # fill in DNS provider credentials
+#   docker network create traefik        # only if the external network is missing
 #   docker compose --profile ntrips-dns up -d
 # Optional: reuse Traefik's existing LE material instead:
 #   docker compose --profile ntrips-traefik up -d
 #
-# Then add to config.json:
+# Then add to config.json and restart the core (TLS listen settings are startup-only):
 #   "tls": { "port": 2102, "certFile": "/certs/cert.pem", "keyFile": "/certs/key.pem" }
 
 services:
@@ -44,19 +46,17 @@ services:
       - "traefik.http.services.neartrip-ui.loadbalancer.server.port=3000"  # Admin UI port
 
   # DNS-01 Let's Encrypt via lego (no HTTP/TLS-ALPN, no port 443).
-  # Requires a DNS provider API token that can create TXT records.
-  # Example (Cloudflare): set PROVIDER=cloudflare and CLOUDFLARE_DNS_API_TOKEN.
-  # See https://go-acme.github.io/lego/dns/ for other providers' env vars.
+  # Put provider credentials in .env.ntrips (see .env.ntrips.example); that file is
+  # loaded into the container so any lego DNS provider env vars are available.
   ntrips-acme:
     image: brahmadev/acme-lego-cron:latest
+    # Provider tokens and lego settings come from this file (see .env.ntrips.example).
+    # Do not re-declare DOMAINS/PROVIDER here with empty ${...:-} defaults — that
+    # would override env_file and blank out credentials for non-Cloudflare providers.
+    env_file:
+      - path: .env.ntrips
+        required: false
     environment:
-      # Required when using --profile ntrips-dns (see .env.ntrips.example).
-      STAGING: ${NTRIPS_ACME_STAGING:-0}
-      DOMAINS: ${PUBLIC_HOSTNAME:-}
-      EMAIL_ADDRESS: ${NTRIPS_ACME_EMAIL:-}
-      PROVIDER: ${NTRIPS_DNS_PROVIDER:-}
-      CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN:-}
-      LEGO_ARGS: ${NTRIPS_LEGO_ARGS:---dns.resolvers 1.1.1.1}
       NTRIPS_CERT_DIR: /certs
     volumes:
       - ntrips-acme-data:/letsencrypt
@@ -67,7 +67,8 @@ services:
       - ntrips-dns
 
   # Optional: export Traefik's existing LE PEMs (same hostname as the UI).
-  # Only useful if Traefik already has a cert for PUBLIC_HOSTNAME.
+  # dumper writes certs/<domain>.pem + private/<domain>.pem; the publisher
+  # copies PUBLIC_HOSTNAME into the fixed cert.pem / key.pem NearTRIP expects.
   certs-dumper:
     image: ldez/traefik-certs-dumper:v2.9.3
     command:
@@ -77,8 +78,6 @@ services:
       - --source=/traefik/acme.json
       - --dest=/certs
       - --domain-subdir=false
-      - --crt-name=cert
-      - --key-name=key
       - --crt-ext=.pem
       - --key-ext=.pem
     volumes:
@@ -86,6 +85,19 @@ services:
       - ntrip-certs:/certs
     networks:
       - traefik
+    restart: unless-stopped
+    profiles:
+      - ntrips-traefik
+
+  certs-publish:
+    image: alpine:3.20
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:-}
+      NTRIPS_CERT_DIR: /certs
+    volumes:
+      - ntrip-certs:/certs
+      - ./docker/ntrips-publish-traefik-certs.sh:/publish.sh:ro
+    entrypoint: ["/bin/sh", "/publish.sh"]
     restart: unless-stopped
     profiles:
       - ntrips-traefik

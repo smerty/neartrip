@@ -280,11 +280,19 @@ second port (default 2102). Clients connect to that port directly — Traefik on
 }
 ```
 
-Omit the `tls` block to keep a plain-only deployment. Certificate and key files
-are reloaded automatically when their mtimes change. Publish host port **2102**
+Omit the `tls` block to keep a plain-only deployment. Publish host port **2102**
 (firewall / security group) and point publishers at `PUBLIC_HOSTNAME:2102` with
 TLS enabled (for example [rustk-caster](https://github.com/ppicazo/rustk-caster)
 with `tls = true`).
+
+**Startup vs reload:** binding the TLS listen port and choosing cert/key paths
+happens when the core starts. Adding or changing the `tls` block requires a
+**core restart**. After TLS is enabled, replacing the PEM files on disk is
+enough — NearTRIP reloads certificate material when those files' mtimes change.
+
+Compose always attaches the `ntrip` service to an external Docker network named
+`traefik` (used for the admin UI). Create it once if it does not exist:
+`docker network create traefik`.
 
 #### Certificates without Traefik (recommended): DNS-01
 
@@ -292,19 +300,22 @@ Let's Encrypt via **DNS-01** needs a DNS provider API token that can create
 temporary `_acme-challenge` TXT records. It does **not** use port 80 or 443, so
 it works whether or not you run Traefik.
 
-1. Copy [`.env.ntrips.example`](.env.ntrips.example) into your Compose `.env`
-   (set `PUBLIC_HOSTNAME`, `NTRIPS_ACME_EMAIL`, `NTRIPS_DNS_PROVIDER`, and the
-   provider token — Cloudflare example uses `CLOUDFLARE_DNS_API_TOKEN`).
-   Other providers: [lego DNS docs](https://go-acme.github.io/lego/dns/).
-2. Start with the DNS profile:
+1. Copy [`.env.ntrips.example`](.env.ntrips.example) to `.env.ntrips` and set
+   lego's `DOMAINS`, `EMAIL_ADDRESS`, `PROVIDER`, plus that provider's
+   credential variables (Cloudflare: `CLOUDFLARE_DNS_API_TOKEN`). Compose loads
+   `.env.ntrips` into the ACME container so tokens for any
+   [lego DNS provider](https://go-acme.github.io/lego/dns/) are available.
+   Set the same hostname as `PUBLIC_HOSTNAME` in the Compose project `.env` for
+   the `ntrip` service.
+2. Ensure the external `traefik` network exists (see above), then start:
    ```bash
    docker compose --profile ntrips-dns up -d
    ```
 3. When `/certs/cert.pem` and `/certs/key.pem` appear, add the `tls` block above
-   and reload/restart the core if it was already running without TLS.
+   and **restart the core** so it binds the TLS port.
 
-Use `NTRIPS_ACME_STAGING=1` for the first run against the staging CA, then set
-it back to `0` for a production certificate.
+Use `STAGING=1` in `.env.ntrips` for the first run against the staging CA, then
+set it back to `0` for a production certificate.
 
 #### Optional: reuse Traefik's certificate
 
@@ -315,8 +326,11 @@ its PEMs instead of running DNS-01:
 docker compose --profile ntrips-traefik up -d
 ```
 
-Point `TRAEFIK_ACME_JSON` at Traefik's `acme.json`. Prefer DNS-01 when you are
-not running Traefik, or when you want NTRIPS certs independent of the UI stack.
+Point `TRAEFIK_ACME_JSON` at Traefik's `acme.json`. The dumper writes
+`certs/<hostname>.pem` and `private/<hostname>.pem`; a small publisher service
+copies `PUBLIC_HOSTNAME`'s pair to `/certs/cert.pem` and `/certs/key.pem`.
+Prefer DNS-01 when you are not running Traefik, or when you want NTRIPS certs
+independent of the UI stack.
 
 #### Manual PEMs
 

@@ -5,10 +5,19 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+#[cfg(test)]
+use tokio::net::TcpStream;
 use tokio::sync::watch;
+
+/// Client-facing connection after optional TLS handshake.
+pub trait ClientStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ClientStream for T {}
+pub type ClientIo = Box<dyn ClientStream>;
+pub type ClientRead = tokio::io::ReadHalf<ClientIo>;
+pub type ClientWrite = tokio::io::WriteHalf<ClientIo>;
 
 use crate::config::Config;
 use crate::geo::{select_station, SWITCH_MARGIN_M};
@@ -65,6 +74,7 @@ pub async fn serve(
 ) {
     serve_with_hub(
         listener,
+        None,
         configs,
         registry,
         shutdown,
@@ -75,6 +85,7 @@ pub async fn serve(
 
 pub async fn serve_with_hub(
     listener: TcpListener,
+    tls: Option<(TcpListener, Arc<crate::tls::ReloadingAcceptor>)>,
     configs: watch::Receiver<Config>,
     registry: Arc<Registry>,
     mut shutdown: watch::Receiver<bool>,
@@ -82,6 +93,7 @@ pub async fn serve_with_hub(
 ) {
     let admission = crate::admission::Admission::default();
     let mut clients = tokio::task::JoinSet::new();
+    let mut tls_refresh = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             Some(_) = clients.join_next(), if !clients.is_empty() => {},
@@ -90,13 +102,22 @@ pub async fn serve_with_hub(
                     break;
                 }
             }
+            _ = tls_refresh.tick(), if tls.is_some() => {
+                if let Some((_, acceptor)) = &tls {
+                    match acceptor.refresh_if_changed().await {
+                        Ok(true) => tracing::info!("TLS certificate reloaded"),
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(%err, "TLS certificate reload failed"),
+                    }
+                }
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((mut socket, peer)) => {
+                        let _ = socket.set_nodelay(true);
                         if !registry.security.admit(peer.ip(), &configs.borrow().security, crate::caster::now_ms()) {
                             let _ = tokio::time::timeout(Duration::from_millis(10),
                                 socket.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")).await;
-                            // Rejected peers never allocate tasks, records, or log files.
                             drop(socket);
                             continue;
                         }
@@ -105,6 +126,44 @@ pub async fn serve_with_hub(
                             drop(socket);
                             continue;
                         };
+                        spawn_session(
+                            &mut clients,
+                            Box::new(socket) as ClientIo,
+                            peer,
+                            lease,
+                            limits.handshake_timeout_seconds,
+                            &configs,
+                            &registry,
+                            &shutdown,
+                            &hub,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(%err, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            accepted = async {
+                match &tls {
+                    Some((tls_listener, _)) => tls_listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match accepted {
+                    Ok((socket, peer)) => {
+                        let _ = socket.set_nodelay(true);
+                        let Some((_, acceptor)) = &tls else { continue };
+                        if !registry.security.admit(peer.ip(), &configs.borrow().security, crate::caster::now_ms()) {
+                            drop(socket);
+                            continue;
+                        }
+                        let limits = configs.borrow().connection_limits.clone();
+                        let Some(lease) = admission.acquire(peer.ip(), &limits) else {
+                            drop(socket);
+                            continue;
+                        };
+                        let acceptor = acceptor.acceptor().await;
                         let hub = hub.clone();
                         let configs = configs.clone();
                         let registry = Arc::clone(&registry);
@@ -112,18 +171,48 @@ pub async fn serve_with_hub(
                         clients.spawn(async move {
                             let live = registry.open_admitted(peer, lease.pending());
                             let mut cleanup = SessionCleanup::new(&registry, &live.id);
-                            let deadline = Instant::now() + Duration::from_secs(limits.handshake_timeout_seconds);
+                            let deadline = Instant::now()
+                                + Duration::from_secs(limits.handshake_timeout_seconds);
+                            let tls_timeout = Duration::from_secs(limits.handshake_timeout_seconds);
+                            if *shutdown.borrow() {
+                                cleanup.finish("core shutdown");
+                                return;
+                            }
+                            // Race shutdown so a silent TLS peer cannot delay JoinSet drain.
+                            let tls_stream = tokio::select! {
+                                _ = shutdown.changed() => {
+                                    cleanup.finish("core shutdown");
+                                    return;
+                                }
+                                result = tokio::time::timeout(tls_timeout, acceptor.accept(socket)) => {
+                                    match result {
+                                        Ok(Ok(stream)) => stream,
+                                        Ok(Err(err)) => {
+                                            cleanup.finish(&format!("TLS handshake failed: {err}"));
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            cleanup.finish("TLS handshake timeout");
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
                             let policy_configs = configs.clone();
-                            let session = handle_client(socket, peer, configs, &registry, &live, &hub);
+                            let session = handle_client(
+                                Box::new(tls_stream) as ClientIo,
+                                peer,
+                                configs,
+                                &registry,
+                                &live,
+                                &hub,
+                            );
                             tokio::pin!(session);
                             let mut policy_tick = tokio::time::interval(Duration::from_secs(1));
                             let reason = loop {
                                 tokio::select! {
                                     _ = shutdown.changed() => break "core shutdown".to_string(),
                                     _ = tokio::time::sleep_until(deadline), if lease.is_pending() => {
-                                        // select! guards are evaluated on entry, not when
-                                        // the timer fires. Authentication may have completed
-                                        // while the streaming future remained pending.
                                         if lease.is_pending() {
                                             break "handshake timeout".to_string();
                                         }
@@ -143,7 +232,7 @@ pub async fn serve_with_hub(
                         });
                     }
                     Err(err) => {
-                        tracing::error!(%err, "accept failed");
+                        tracing::error!(%err, "TLS accept failed");
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
@@ -151,6 +240,53 @@ pub async fn serve_with_hub(
         }
     }
     while clients.join_next().await.is_some() {}
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(
+    clients: &mut tokio::task::JoinSet<()>,
+    socket: ClientIo,
+    peer: SocketAddr,
+    lease: crate::admission::Lease,
+    handshake_timeout_seconds: u64,
+    configs: &watch::Receiver<Config>,
+    registry: &Arc<Registry>,
+    shutdown: &watch::Receiver<bool>,
+    hub: &Arc<crate::caster::Hub>,
+) {
+    let hub = hub.clone();
+    let configs = configs.clone();
+    let registry = Arc::clone(registry);
+    let mut shutdown = shutdown.clone();
+    clients.spawn(async move {
+        let live = registry.open_admitted(peer, lease.pending());
+        let mut cleanup = SessionCleanup::new(&registry, &live.id);
+        let deadline = Instant::now() + Duration::from_secs(handshake_timeout_seconds);
+        let policy_configs = configs.clone();
+        let session = handle_client(socket, peer, configs, &registry, &live, &hub);
+        tokio::pin!(session);
+        let mut policy_tick = tokio::time::interval(Duration::from_secs(1));
+        let reason = loop {
+            tokio::select! {
+                _ = shutdown.changed() => break "core shutdown".to_string(),
+                _ = tokio::time::sleep_until(deadline), if lease.is_pending() => {
+                    if lease.is_pending() {
+                        break "handshake timeout".to_string();
+                    }
+                }
+                _ = policy_tick.tick() => {
+                    if registry.rover_revoked(&live.id, &policy_configs.borrow()) {
+                        break "rover access revoked".to_string();
+                    }
+                    if registry.security.blocked(peer.ip(), &policy_configs.borrow().security, crate::caster::now_ms()) {
+                        break "IP banned".to_string();
+                    }
+                }
+                reason = &mut session => break reason,
+            }
+        };
+        cleanup.finish(&reason);
+    });
 }
 
 // Runs during unwinding and cancellation as well as normal disconnects.
@@ -182,14 +318,13 @@ impl Drop for SessionCleanup<'_> {
 }
 
 async fn handle_client(
-    socket: TcpStream,
+    socket: ClientIo,
     peer: SocketAddr,
     configs: watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
     hub: &crate::caster::Hub,
 ) -> String {
-    let _ = socket.set_nodelay(true);
     let id = &live.id;
     tracing::info!(%id, %peer, "client connected");
     let reason = session(socket, configs.clone(), registry, live, hub)
@@ -219,13 +354,13 @@ async fn handle_client(
 }
 
 async fn session(
-    socket: TcpStream,
+    socket: ClientIo,
     configs: watch::Receiver<Config>,
     registry: &Registry,
     live: &crate::registry::LiveSession,
     hub: &crate::caster::Hub,
 ) -> Result<(), String> {
-    let (mut client_read, mut client_write) = socket.into_split();
+    let (mut client_read, mut client_write) = tokio::io::split(socket);
     let mut incoming = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
@@ -397,8 +532,8 @@ pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 async fn stream(
-    mut client_read: OwnedReadHalf,
-    mut client_write: OwnedWriteHalf,
+    mut client_read: ClientRead,
+    mut client_write: ClientWrite,
     pending: Vec<u8>,
     configs: watch::Receiver<Config>,
     registry: &Registry,
@@ -887,7 +1022,7 @@ async fn read_upstream(
     }
 }
 
-async fn read_some(socket: &mut OwnedReadHalf, buf: &mut [u8]) -> Result<usize, String> {
+async fn read_some(socket: &mut ClientRead, buf: &mut [u8]) -> Result<usize, String> {
     match tokio::time::timeout(READ_IDLE, socket.read(buf)).await {
         Ok(Ok(0)) => Err("client closed".into()),
         Ok(Ok(n)) => Ok(n),

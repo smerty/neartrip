@@ -255,17 +255,88 @@ The equivalent configuration in `config.json` or the Settings JSON editor is:
 ```
 
 Configure the base's NTRIP server/upload mode with host `rtk.k6sh.com`, the
-configured TCP port (default 2101), mountpoint `MY_BASE`, and the publisher's
-credentials. The hostname must point to the deployed server and its TCP port
-must be reachable. NTRIP v1 `SOURCE` uses the publisher password; NTRIP v2
-`POST` uses Basic authentication. Chunked uploads are currently rejected (501);
-use an unchunked upload mode. A POST with `Content-Length` ends at that body
-boundary and releases its mountpoint; bytes after the body are discarded and
-the connection is closed rather than reused for another request. Invalid or
-duplicate length headers are rejected before accepting an upload. POST without
-a length and legacy SOURCE uploads continue until disconnection or idle timeout.
-The listener is plain TCP; transport encryption
-requires compatible TLS termination or a trusted network.
+configured TCP port (default 2101, or 2102 for NTRIPS), mountpoint `MY_BASE`,
+and the publisher's credentials. The hostname must point to the deployed server
+and its TCP port must be reachable. NTRIP v1 `SOURCE` uses the publisher
+password; NTRIP v2 `POST` uses Basic authentication. Chunked uploads are
+currently rejected (501); use an unchunked upload mode. A POST with
+`Content-Length` ends at that body boundary and releases its mountpoint; bytes
+after the body are discarded and the connection is closed rather than reused for
+another request. Invalid or duplicate length headers are rejected before
+accepting an upload. POST without a length and legacy SOURCE uploads continue
+until disconnection or idle timeout.
+
+### NTRIPS (TLS)
+
+Plain NTRIP stays on `port` (default 2101). Optional in-process TLS listens on a
+second port (default 2102). Clients connect to that port directly — Traefik on
+80/443 only serves the admin UI and does **not** terminate NTRIPS.
+
+```json
+"tls": {
+  "port": 2102,
+  "certFile": "/certs/cert.pem",
+  "keyFile": "/certs/key.pem"
+}
+```
+
+Omit the `tls` block to keep a plain-only deployment. Publish host port **2102**
+(firewall / security group) and point publishers at `PUBLIC_HOSTNAME:2102` with
+TLS enabled (for example [rustk-caster](https://github.com/ppicazo/rustk-caster)
+with `tls = true`).
+
+**Startup vs reload:** binding the TLS listen port and choosing cert/key paths
+happens when the core starts. Adding or changing the `tls` block requires a
+**core restart**. After TLS is enabled, replacing the PEM files on disk is
+enough — NearTRIP reloads certificate material when those files' mtimes change.
+
+Compose always attaches the `ntrip` service to an external Docker network named
+`traefik` (used for the admin UI). Create it once if it does not exist:
+`docker network create traefik`.
+
+#### Certificates without Traefik (recommended): DNS-01
+
+Let's Encrypt via **DNS-01** needs a DNS provider API token that can create
+temporary `_acme-challenge` TXT records. It does **not** use port 80 or 443, so
+it works whether or not you run Traefik.
+
+1. Copy [`.env.ntrips.example`](.env.ntrips.example) to `.env.ntrips` and set
+   lego's `DOMAINS`, `EMAIL_ADDRESS`, `PROVIDER`, plus that provider's
+   credential variables (Cloudflare: `CLOUDFLARE_DNS_API_TOKEN`). Compose loads
+   `.env.ntrips` into the ACME container so tokens for any
+   [lego DNS provider](https://go-acme.github.io/lego/dns/) are available.
+   Set the same hostname as `PUBLIC_HOSTNAME` in the Compose project `.env` for
+   the `ntrip` service.
+2. Ensure the external `traefik` network exists (see above), then start:
+   ```bash
+   docker compose --profile ntrips-dns up -d
+   ```
+3. When `/certs/cert.pem` and `/certs/key.pem` appear, add the `tls` block above
+   and **restart the core** so it binds the TLS port.
+
+Use `STAGING=1` in `.env.ntrips` for the first run against the staging CA, then
+set it back to `0` for a production certificate.
+
+#### Optional: reuse Traefik's certificate
+
+If Traefik already has a Let's Encrypt cert for `PUBLIC_HOSTNAME`, you can dump
+its PEMs instead of running DNS-01:
+
+```bash
+docker compose --profile ntrips-traefik up -d
+```
+
+Point `TRAEFIK_ACME_JSON` at Traefik's `acme.json`. The dumper writes
+`certs/<hostname>.pem` and `private/<hostname>.pem`; a small publisher service
+copies `PUBLIC_HOSTNAME`'s pair to `/certs/cert.pem` and `/certs/key.pem`.
+Prefer DNS-01 when you are not running Traefik, or when you want NTRIPS certs
+independent of the UI stack.
+
+#### Manual PEMs
+
+Any process that writes `cert.pem` / `key.pem` works (certbot DNS plugin,
+acme.sh, a commercial cert). Mount them at the paths in the `tls` block; NearTRIP
+picks up renewals when the files change.
 
 Rovers use their normal rover credentials. Request `MY_BASE` for a fixed base
 (no GGA required), or the existing virtual mountpoint for nearest-station

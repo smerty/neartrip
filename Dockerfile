@@ -14,6 +14,6 @@ COPY --from=core /build/target/release/neartrip /usr/local/bin/neartrip
 RUN mkdir -p logs
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-EXPOSE 2101 3000
+EXPOSE 2101 2102 3000
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "server.js"]

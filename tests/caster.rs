@@ -146,6 +146,7 @@ async fn nearest_sources_switch_on_gga_staleness_recovery_and_disable() {
     ));
     let task = tokio::spawn(neartrip::server::serve_with_hub(
         listener,
+        None,
         configs,
         registry,
         shutdown,
@@ -317,6 +318,7 @@ async fn learns_position_for_nearest_and_sourcetable_without_changing_stream_byt
     let hub = Arc::new(neartrip::caster::Hub::default());
     let task = tokio::spawn(neartrip::server::serve_with_hub(
         listener,
+        None,
         configs.clone(),
         Arc::new(Registry::new(dir.join("sessions.json"))),
         shutdown,
@@ -424,6 +426,7 @@ async fn onboarding_holds_nearest_until_confirmed_and_requalifies_after_movement
     let hub = Arc::new(neartrip::caster::Hub::default());
     let task = tokio::spawn(neartrip::server::serve_with_hub(
         listener,
+        None,
         configs,
         Arc::new(Registry::new(dir.join("sessions.json"))),
         shutdown,
@@ -495,6 +498,7 @@ async fn length_framed_post_stops_at_body_boundary_and_releases_mountpoint() {
     let hub = Arc::new(neartrip::caster::Hub::default());
     let task = tokio::spawn(neartrip::server::serve_with_hub(
         listener,
+        None,
         configs,
         Arc::new(Registry::new(dir.join("sessions.json"))),
         shutdown,
